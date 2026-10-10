@@ -37,13 +37,15 @@ After dialing **1400**, the mic stays open. Speak naturally — when you pause (
 
 ## Deploy on Render
 
-1. Push this repo to GitHub.  
-2. Create a **Web Service** on [Render](https://render.com).  
-3. Settings:
-   - **Build command:** `npm install && npm run build`
-   - **Start command:** `npm start`
-   - **Environment:** `GROQ_API_KEY` = your Groq key  
-4. Deploy and open the service URL. Dial `1400`.
+This repo includes [`render.yaml`](render.yaml).
+
+1. Push to **GitHub** (Render cannot pull from Cursor Origin).  
+2. In [Render](https://dashboard.render.com): **New → Blueprint** (or Web Service) and select the repo.  
+3. Set secret env var `GROQ_API_KEY`.  
+4. Build: `npm install --include=dev && npm run build` · Start: `npm start`  
+5. Open the `*.onrender.com` URL and dial `1400`.
+
+Free tier spins down after idle — first request after sleep can take ~30s.
 
 ## API
 
