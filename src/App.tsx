@@ -13,7 +13,7 @@ function App() {
   const [number, setNumber] = useState('');
   const [callStatus, setCallStatus] = useState<'idle' | 'calling' | 'connected' | 'failed'>('idle');
   const { playDTMF, playRingtone, playFailureMessage, stopAllAudio, playEndBeep } = useAudio();
-  const { phase, error, muted, startCall, hangup, toggleMute } = useVoiceCall();
+  const { phase, error, muted, unlockAudio, startCall, hangup, toggleMute } = useVoiceCall();
 
   const handleKeyPress = useCallback((key: string) => {
     if (number.length < 15) {
@@ -36,6 +36,9 @@ function App() {
 
   const startDial = () => {
     if (!number) return;
+
+    // Must run in the click handler — unlocks autoplay for async TTS on Render/mobile
+    unlockAudio();
 
     setCallStatus('calling');
     playRingtone();

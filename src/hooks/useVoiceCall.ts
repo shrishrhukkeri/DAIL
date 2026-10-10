@@ -112,10 +112,14 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
   const abortRef = useRef<AbortController | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  /** Mic analysis context (may share playback ctx). */
   const audioCtxRef = useRef<AudioContext | null>(null);
+  /** Kept alive across the ringtone delay so TTS isn't blocked by autoplay. */
+  const playbackCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const chunksRef = useRef<Blob[]>([]);
-  const audioQueueRef = useRef<HTMLAudioElement[]>([]);
+  const audioQueueRef = useRef<AudioBuffer[]>([]);
+  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const playingRef = useRef(false);
   const activeRef = useRef(false);
   const speakChainRef = useRef<Promise<void>>(Promise.resolve());
@@ -140,13 +144,49 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
   }, []);
 
   const stopPlayback = useCallback(() => {
-    audioQueueRef.current.forEach((a) => {
-      a.pause();
-      a.src = '';
+    activeSourcesRef.current.forEach((src) => {
+      try {
+        src.onended = null;
+        src.stop();
+        src.disconnect();
+      } catch {
+        /* ignore */
+      }
     });
+    activeSourcesRef.current = [];
     audioQueueRef.current = [];
     playingRef.current = false;
     if (typeof window !== 'undefined' && window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+  }, []);
+
+  /** Call from the dial button click (user gesture) before any setTimeout. */
+  const unlockAudio = useCallback(() => {
+    const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    if (!playbackCtxRef.current || playbackCtxRef.current.state === 'closed') {
+      playbackCtxRef.current = new AC();
+    }
+    const ctx = playbackCtxRef.current;
+    void ctx.resume();
+
+    // Silent buffer "primes" autoplay so later async TTS can play
+    const buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+    try {
+      source.start(0);
+    } catch {
+      /* ignore */
+    }
+
+    if (typeof window !== 'undefined' && window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+      // Some browsers need speak() once under a gesture
+      const warm = new SpeechSynthesisUtterance(' ');
+      warm.volume = 0;
+      window.speechSynthesis.speak(warm);
       window.speechSynthesis.cancel();
     }
   }, []);
@@ -179,10 +219,11 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
     mediaStreamRef.current = null;
     analyserRef.current = null;
-    if (audioCtxRef.current) {
+    // Don't close playbackCtxRef here — it must stay unlocked for TTS
+    if (audioCtxRef.current && audioCtxRef.current !== playbackCtxRef.current) {
       void audioCtxRef.current.close().catch(() => undefined);
-      audioCtxRef.current = null;
     }
+    audioCtxRef.current = null;
   }, [stopRecorderOnly]);
 
   const hangup = useCallback(() => {
@@ -193,6 +234,10 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     abortRef.current = null;
     tearDownMic();
     stopPlayback();
+    if (playbackCtxRef.current) {
+      void playbackCtxRef.current.close().catch(() => undefined);
+      playbackCtxRef.current = null;
+    }
     messagesRef.current = [];
     speakChainRef.current = Promise.resolve();
     mutedRef.current = false;
@@ -266,29 +311,35 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
   const playNext = useCallback(() => {
     if (playingRef.current) return;
     const next = audioQueueRef.current.shift();
-    if (!next) {
+    const ctx = playbackCtxRef.current;
+    if (!next || !ctx) {
       if (activeRef.current && !busyRef.current && phaseRef.current === 'speaking') {
         startRecorder();
         setPhaseSafe('listening');
       }
       return;
     }
+
     playingRef.current = true;
     setPhaseSafe('speaking');
-    next.onended = () => {
+    void ctx.resume();
+
+    const source = ctx.createBufferSource();
+    source.buffer = next;
+    source.connect(ctx.destination);
+    activeSourcesRef.current.push(source);
+
+    const finish = () => {
+      activeSourcesRef.current = activeSourcesRef.current.filter((s) => s !== source);
       playingRef.current = false;
-      URL.revokeObjectURL(next.src);
       playNext();
     };
-    next.onerror = () => {
-      playingRef.current = false;
-      URL.revokeObjectURL(next.src);
-      playNext();
-    };
-    void next.play().catch(() => {
-      playingRef.current = false;
-      playNext();
-    });
+    source.onended = finish;
+    try {
+      source.start(0);
+    } catch {
+      finish();
+    }
   }, [setPhaseSafe, startRecorder]);
 
   const speakWithBrowser = useCallback(
@@ -362,8 +413,17 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
 
           const blob = await res.blob();
           if (signal.aborted || !activeRef.current) return;
-          const url = URL.createObjectURL(blob);
-          audioQueueRef.current.push(new Audio(url));
+
+          const ctx = playbackCtxRef.current;
+          if (!ctx) {
+            console.warn('Playback AudioContext missing — call unlockAudio() on dial');
+            return;
+          }
+          await ctx.resume();
+          const arrayBuf = await blob.arrayBuffer();
+          const audioBuf = await ctx.decodeAudioData(arrayBuf.slice(0));
+          if (signal.aborted || !activeRef.current) return;
+          audioQueueRef.current.push(audioBuf);
           playNext();
         })
         .catch((err) => {
@@ -612,7 +672,13 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     mediaStreamRef.current = stream;
     mimeTypeRef.current = pickMimeType();
 
-    const ctx = new AudioContext();
+    // Reuse unlocked playback context when possible (avoids iOS autoplay lock)
+    const ctx =
+      playbackCtxRef.current && playbackCtxRef.current.state !== 'closed'
+        ? playbackCtxRef.current
+        : new (window.AudioContext ||
+            (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+    playbackCtxRef.current = ctx;
     audioCtxRef.current = ctx;
     if (ctx.state === 'suspended') await ctx.resume();
     const source = ctx.createMediaStreamSource(stream);
@@ -624,10 +690,24 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
   }, []);
 
   const startCall = useCallback(async () => {
-    hangup();
-    activeRef.current = true;
+    // Soft reset — keep unlocked playback AudioContext
+    activeRef.current = false;
+    busyRef.current = false;
+    finalizeLockRef.current = false;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    tearDownMic();
+    stopPlayback();
     messagesRef.current = [];
+    speakChainRef.current = Promise.resolve();
+    mutedRef.current = false;
+    setMuted(false);
     setError(null);
+
+    activeRef.current = true;
+    if (playbackCtxRef.current?.state === 'suspended') {
+      await playbackCtxRef.current.resume();
+    }
 
     try {
       await openMic();
@@ -638,7 +718,7 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
       setError(message);
       setPhaseSafe('error');
     }
-  }, [hangup, openMic, setPhaseSafe, startVadLoop]);
+  }, [openMic, setPhaseSafe, startVadLoop, stopPlayback, tearDownMic]);
 
   const toggleMute = useCallback(() => {
     const next = !mutedRef.current;
@@ -666,6 +746,7 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     phase,
     error,
     muted,
+    unlockAudio,
     startCall,
     hangup,
     toggleMute,
