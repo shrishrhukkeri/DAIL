@@ -1,0 +1,137 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600&display=swap');
+
+:root {
+  --bg-color: #000000;
+  --surface-color: #1c1c1e;
+  --text-color: #ffffff;
+  --accent-green: #34c759;
+  --accent-red: #ff3b30;
+  --glass-bg: rgba(255, 255, 255, 0.1);
+  --glass-border: rgba(255, 255, 255, 0.1);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  background-color: var(--bg-color);
+  color: var(--text-color);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  height: 100svh;
+}
+
+#root {
+  height: 100svh;
+  display: flex;
+  justify-content: center;
+}
+
+.phone-container {
+  width: 100%;
+  max-width: 450px;
+  height: 100svh;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  /* Very aggressive bottom padding to force the UI upwards away from mobile navigation */
+  padding: 2svh 25px 30svh; 
+  overflow: hidden;
+  justify-content: flex-start;
+  align-items: center;
+}
+
+/* Glass panel for the call screen overlay */
+.glass-panel {
+  background: rgba(0, 0, 0, 0.95);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding-bottom: 20svh;
+}
+
+/* Keypad Styles */
+.keypad-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: clamp(12px, 4.5vw, 22px);
+  width: 100%;
+  max-width: 320px;
+  margin: 0 auto;
+}
+
+.key-button {
+  aspect-ratio: 1/1;
+  border-radius: 50%;
+  background: #262629;
+  border: none;
+  color: white;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.1s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.key-button:active {
+  background: #444;
+  transform: scale(0.95);
+}
+
+.key-number {
+  font-size: clamp(28px, 9vw, 36px);
+  font-weight: 400;
+  line-height: 1;
+}
+
+.key-letters {
+  font-size: clamp(8px, 2vw, 10px);
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: rgba(255, 255, 255, 0.4);
+  margin-top: 2px;
+  text-transform: uppercase;
+}
+
+.call-button-container {
+  margin-top: clamp(25px, 8vw, 45px);
+  display: flex;
+  justify-content: center;
+}
+
+.call-button {
+  width: clamp(70px, 18vw, 85px);
+  height: clamp(70px, 18vw, 85px);
+  border-radius: 50%;
+  background: var(--accent-green);
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  cursor: pointer;
+  transition: transform 0.2s;
+  box-shadow: 0 0 30px rgba(52, 199, 89, 0.2);
+}
+
+.call-button:active {
+  transform: scale(0.9);
+}
+
+.end-call-button {
+  background: var(--accent-red);
+  box-shadow: 0 0 30px rgba(255, 59, 48, 0.2);
+}

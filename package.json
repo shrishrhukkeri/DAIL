@@ -1,0 +1,47 @@
+{
+  "name": "ph",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:client": "vite",
+    "dev:server": "node server/index.js",
+    "build": "tsc -b && vite build",
+    "start": "node server/index.js",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.7",
+    "express": "^5.3.0",
+    "framer-motion": "^12.38.0",
+    "groq-sdk": "^1.6.0",
+    "lucide-react": "^1.14.0",
+    "multer": "^2.4.0",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/multer": "^2.3.0",
+    "@types/node": "^24.12.2",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "concurrently": "^10.0.6",
+    "eslint": "^10.2.1",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.2",
+    "globals": "^17.5.0",
+    "typescript": "~6.0.2",
+    "typescript-eslint": "^8.58.2",
+    "vite": "^8.0.10"
+  }
+}
