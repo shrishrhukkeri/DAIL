@@ -41,9 +41,17 @@ function requireGroq(req, res, next) {
   next();
 }
 
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, hasKey: Boolean(GROQ_API_KEY) });
-});
+function healthHandler(_req, res) {
+  res.status(200).json({
+    ok: true,
+    status: 'up',
+    ts: new Date().toISOString(),
+  });
+}
+
+/** Lightweight keep-alive for cron-job.org / uptime pings */
+app.get('/health', healthHandler);
+app.get('/api/health', healthHandler);
 
 app.post('/api/transcribe', requireGroq, upload.single('audio'), async (req, res) => {
   try {

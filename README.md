@@ -54,4 +54,12 @@ Free tier spins down after idle — first request after sleep can take ~30s.
 | `POST /api/transcribe` | multipart `audio` → `{ text }` |
 | `POST /api/chat` | `{ messages }` → SSE token stream |
 | `POST /api/speak` | `{ text }` → `audio/wav` |
-| `GET /api/health` | liveness / key presence |
+| `GET /health` | liveness (for cron keep-alive) |
+| `GET /api/health` | same as `/health` |
+
+### Keep Render awake (cron-job.org)
+
+1. Create a job at [cron-job.org](https://cron-job.org)  
+2. URL: `https://YOUR-SERVICE.onrender.com/health`  
+3. Schedule: every **10–14 minutes** (GET)  
+4. Expect **200** with `{ "ok": true, "status": "up", ... }`
