@@ -19,12 +19,12 @@ const CHAT_MODEL = process.env.GROQ_CHAT_MODEL || 'openai/gpt-oss-20b';
 const STT_MODEL = process.env.GROQ_STT_MODEL || 'whisper-large-v3-turbo';
 const TTS_MODEL = process.env.GROQ_TTS_MODEL || 'canopylabs/orpheus-v1-english';
 const TTS_VOICE = process.env.GROQ_TTS_VOICE || 'austin';
-const CHAT_MAX_TOKENS = Number(process.env.GROQ_CHAT_MAX_TOKENS || 120);
+const CHAT_MAX_TOKENS = Number(process.env.GROQ_CHAT_MAX_TOKENS || 280);
 const CHAT_HISTORY_LIMIT = Number(process.env.GROQ_CHAT_HISTORY_LIMIT || 8);
 
 const SYSTEM_PROMPT =
   process.env.GROQ_SYSTEM_PROMPT ||
-  'You are a friendly phone assistant. Reply in 1 short spoken sentence when possible (max 2). No markdown, lists, or URLs.';
+  'You are a friendly phone assistant. Match reply length to the question: one short sentence for simple greetings or yes/no, a few clear spoken sentences when explaining something, and only go longer if the caller asks for detail. Speak naturally for voice—no markdown, lists, or URLs.';
 
 const app = express();
 const upload = multer({
