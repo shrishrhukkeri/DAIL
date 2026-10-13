@@ -13,7 +13,16 @@ function App() {
   const [number, setNumber] = useState('');
   const [callStatus, setCallStatus] = useState<'idle' | 'calling' | 'connected' | 'failed'>('idle');
   const { playDTMF, playRingtone, playFailureMessage, stopAllAudio, playEndBeep } = useAudio();
-  const { phase, error, muted, unlockAudio, startCall, hangup, toggleMute } = useVoiceCall();
+  const {
+    phase,
+    error,
+    muted,
+    prepareMic,
+    releaseMic,
+    startCall,
+    hangup,
+    toggleMute,
+  } = useVoiceCall();
 
   const dialTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dialTokenRef = useRef(0);
@@ -48,27 +57,39 @@ function App() {
     }, 400);
   }, [playEndBeep, stopAllAudio]);
 
-  const startDial = () => {
+  const startDial = async () => {
     if (!numberRef.current) return;
 
     clearDialTimer();
     const token = ++dialTokenRef.current;
 
-    // Must run in the click handler — unlocks autoplay for async TTS
-    unlockAudio();
+    // Safari: mic + AudioContext MUST be opened in this tap (not after setTimeout)
+    try {
+      await prepareMic();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Microphone access denied';
+      setCallStatus('idle');
+      window.alert(`Microphone required for the call.\n\n${message}`);
+      return;
+    }
+
+    if (token !== dialTokenRef.current) {
+      releaseMic();
+      return;
+    }
 
     setCallStatus('calling');
     playRingtone();
 
     dialTimerRef.current = setTimeout(() => {
       dialTimerRef.current = null;
-      // Ignore stale timers from a previous dial / hangup
       if (token !== dialTokenRef.current) return;
 
       if (numberRef.current === AI_NUMBER) {
         setCallStatus('connected');
         void startCall();
       } else {
+        releaseMic();
         setCallStatus('failed');
         playFailureMessage(handleAutoEnd);
       }
@@ -106,7 +127,7 @@ function App() {
         <Keypad onKeyPress={handleKeyPress} />
 
         <div className="call-button-container">
-          <button className="call-button" onClick={startDial} type="button" aria-label="Call">
+          <button className="call-button" onClick={() => void startDial()} type="button" aria-label="Call">
             <Phone size={32} fill="white" />
           </button>
         </div>

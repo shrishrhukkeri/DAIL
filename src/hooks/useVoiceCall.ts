@@ -52,10 +52,21 @@ function getAudioContextCtor(): typeof AudioContext {
 
 function pickMimeType() {
   if (typeof MediaRecorder === 'undefined') return '';
-  if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) return 'audio/webm;codecs=opus';
-  if (MediaRecorder.isTypeSupported('audio/webm')) return 'audio/webm';
-  if (MediaRecorder.isTypeSupported('audio/mp4')) return 'audio/mp4';
+  // Safari: webm often unsupported — prefer mp4 there. Chrome prefers webm/opus.
+  const candidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+    'audio/aac',
+  ];
+  for (const type of candidates) {
+    if (MediaRecorder.isTypeSupported(type)) return type;
+  }
   return '';
+}
+
+function streamIsLive(stream: MediaStream | null) {
+  return Boolean(stream?.getAudioTracks().some((t) => t.readyState === 'live'));
 }
 
 async function streamChat(
@@ -808,12 +819,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     vadTimerRef.current = setInterval(onVadTick, VAD_INTERVAL_MS);
   }, [onVadTick]);
 
-  const openMic = useCallback(async () => {
-    // Always refresh mic for a new call — stale stopped tracks break listening
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach((t) => t.stop());
-      mediaStreamRef.current = null;
-    }
+  const wireMicAnalyser = useCallback(async (stream: MediaStream) => {
     try {
       micSourceRef.current?.disconnect();
     } catch {
@@ -821,16 +827,6 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     }
     micSourceRef.current = null;
     analyserRef.current = null;
-
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    });
-    mediaStreamRef.current = stream;
-    mimeTypeRef.current = pickMimeType();
 
     const AC = getAudioContextCtor();
     let ctx = playbackCtxRef.current;
@@ -849,6 +845,48 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     analyserRef.current = analyser;
   }, []);
 
+  /**
+   * Safari requires getUserMedia during a user gesture.
+   * Call this from the Call button click — before any setTimeout.
+   */
+  const prepareMic = useCallback(async () => {
+    unlockAudio();
+
+    // Reuse live tracks if still open (e.g. rapid redial)
+    if (streamIsLive(mediaStreamRef.current)) {
+      mediaStreamRef.current!.getAudioTracks().forEach((t) => {
+        t.enabled = true;
+      });
+      await wireMicAnalyser(mediaStreamRef.current!);
+      mimeTypeRef.current = pickMimeType();
+      return;
+    }
+
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+      mediaStreamRef.current = null;
+    }
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+    // Safari sometimes starts tracks muted — force enable
+    stream.getAudioTracks().forEach((t) => {
+      t.enabled = true;
+    });
+    mediaStreamRef.current = stream;
+    mimeTypeRef.current = pickMimeType();
+    await wireMicAnalyser(stream);
+  }, [unlockAudio, wireMicAnalyser]);
+
+  const releaseMic = useCallback(() => {
+    void tearDownMic();
+  }, [tearDownMic]);
+
   const startCall = useCallback(async () => {
     const session = ++sessionRef.current;
 
@@ -857,7 +895,12 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     finalizeLockRef.current = false;
     abortRef.current?.abort();
     abortRef.current = null;
-    await tearDownMic();
+    // Do NOT tearDownMic here — Safari mic was opened in prepareMic() under the dial tap
+    if (vadTimerRef.current) {
+      clearInterval(vadTimerRef.current);
+      vadTimerRef.current = null;
+    }
+    await stopRecorderAsync();
     stopPlayback();
     messagesRef.current = [];
     resetSpeakChain();
@@ -875,7 +918,15 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     }
 
     try {
-      await openMic();
+      if (!streamIsLive(mediaStreamRef.current)) {
+        // Fallback (non-Safari) if prepareMic wasn't called
+        await prepareMic();
+      } else {
+        mediaStreamRef.current!.getAudioTracks().forEach((t) => {
+          t.enabled = true;
+        });
+        await wireMicAnalyser(mediaStreamRef.current!);
+      }
       if (session !== sessionRef.current || !activeRef.current) return;
       startVadLoop();
       await runAssistantTurnRef.current();
@@ -887,13 +938,14 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
       activeRef.current = false;
     }
   }, [
-    openMic,
+    prepareMic,
     resetSpeakChain,
     setPhaseSafe,
     startVadLoop,
     stopPlayback,
-    tearDownMic,
+    stopRecorderAsync,
     unlockAudio,
+    wireMicAnalyser,
   ]);
 
   const toggleMute = useCallback(() => {
@@ -928,6 +980,8 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     error,
     muted,
     unlockAudio,
+    prepareMic,
+    releaseMic,
     startCall,
     hangup,
     toggleMute,
