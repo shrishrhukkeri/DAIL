@@ -6,6 +6,7 @@ import cors from 'cors';
 import multer from 'multer';
 import Groq from 'groq-sdk';
 import { toFile } from 'groq-sdk';
+import { concatWavBuffers } from './wavConcat.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -55,16 +56,39 @@ function healthHandler(_req, res) {
 app.get('/health', healthHandler);
 app.get('/api/health', healthHandler);
 
+function looksLikeMediaContainer(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 4) return false;
+  // EBML / WebM
+  if (buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) return true;
+  // RIFF
+  if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46) return true;
+  // ISO BMFF (mp4/m4a)
+  if (buf.length >= 8 && buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) {
+    return true;
+  }
+  // Ogg
+  if (buf[0] === 0x4f && buf[1] === 0x67 && buf[2] === 0x67 && buf[3] === 0x53) return true;
+  return false;
+}
+
 app.post('/api/transcribe', requireGroq, upload.single('audio'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'Missing audio file' });
     }
+    if (!req.file.buffer?.length || req.file.buffer.length < 200) {
+      return res.status(400).json({ error: 'Audio too short or empty' });
+    }
+    if (!looksLikeMediaContainer(req.file.buffer)) {
+      return res.status(400).json({
+        error: 'Invalid media file (missing container header). Speak again.',
+        code: 'invalid_media_file',
+      });
+    }
 
     const filename = req.file.originalname || 'audio.webm';
-    const file = await toFile(req.file.buffer, filename, {
-      type: req.file.mimetype || 'audio/webm',
-    });
+    const mime = req.file.mimetype || (filename.endsWith('.m4a') ? 'audio/mp4' : 'audio/webm');
+    const file = await toFile(req.file.buffer, filename, { type: mime });
 
     const transcription = await req.groq.audio.transcriptions.create({
       file,
@@ -77,7 +101,12 @@ app.post('/api/transcribe', requireGroq, upload.single('audio'), async (req, res
     res.json({ text: (transcription.text || '').trim() });
   } catch (err) {
     console.error('transcribe error:', err);
-    res.status(500).json({ error: err.message || 'Transcription failed' });
+    const code = err?.error?.error?.code || err?.code;
+    const status = err?.status === 400 || code === 'invalid_media_file' ? 400 : 500;
+    res.status(status).json({
+      error: err.message || 'Transcription failed',
+      code: code || 'transcribe_failed',
+    });
   }
 });
 
@@ -162,34 +191,6 @@ function chunkSpeakText(text, maxLen) {
   }
   if (rest) chunks.push(rest);
   return chunks.filter(Boolean);
-}
-
-function concatWavBuffers(parts) {
-  if (parts.length === 1) return parts[0];
-  const pcmParts = [];
-  let totalPcm = 0;
-  let header = null;
-  for (const buf of parts) {
-    const dataIdx = buf.indexOf(Buffer.from('data'));
-    if (dataIdx < 0) continue;
-    const dataSize = buf.readUInt32LE(dataIdx + 4);
-    const pcm = buf.subarray(dataIdx + 8, dataIdx + 8 + dataSize);
-    if (!header) header = Buffer.from(buf.subarray(0, dataIdx));
-    pcmParts.push(pcm);
-    totalPcm += pcm.length;
-  }
-  if (!header || !pcmParts.length) return parts[0];
-  const out = Buffer.alloc(header.length + 8 + totalPcm);
-  header.copy(out, 0);
-  out.writeUInt32LE(out.length - 8, 4);
-  out.write('data', header.length);
-  out.writeUInt32LE(totalPcm, header.length + 4);
-  let offset = header.length + 8;
-  for (const p of pcmParts) {
-    p.copy(out, offset);
-    offset += p.length;
-  }
-  return out;
 }
 
 function isRateLimited(err) {

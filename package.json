@@ -10,6 +10,7 @@
     "build": "tsc -b && vite build",
     "start": "node server/index.js",
     "lint": "eslint .",
+    "test": "node --test server/wavConcat.test.js",
     "preview": "vite preview"
   },
   "engines": {

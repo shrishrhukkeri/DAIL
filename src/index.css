@@ -36,14 +36,18 @@ body {
   width: 100%;
   max-width: 450px;
   height: 100svh;
+  height: 100dvh;
   position: relative;
   display: flex;
   flex-direction: column;
-  /* Very aggressive bottom padding to force the UI upwards away from mobile navigation */
-  padding: 2svh 25px 30svh; 
+  padding: max(2svh, env(safe-area-inset-top, 0px))
+    max(16px, env(safe-area-inset-right, 0px))
+    max(24px, env(safe-area-inset-bottom, 0px))
+    max(16px, env(safe-area-inset-left, 0px));
   overflow: hidden;
-  justify-content: flex-start;
+  justify-content: center;
   align-items: center;
+  gap: 2svh;
 }
 
 /* Glass panel for the call screen overlay */
@@ -58,7 +62,7 @@ body {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding-bottom: 20svh;
+  padding-bottom: max(24px, env(safe-area-inset-bottom, 0px));
 }
 
 /* Keypad Styles */

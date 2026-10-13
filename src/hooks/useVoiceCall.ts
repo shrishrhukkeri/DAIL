@@ -26,6 +26,11 @@ const VAD_INTERVAL_MS = 40;
 /** Ignore mic for a moment after we start listening so TTS echo doesn't get captured. */
 const LISTEN_GRACE_MS = 350;
 const MIN_AUDIO_BYTES = 200;
+const NOISE_FLOOR_MAX = 0.04;
+const SILENT_WAV =
+  'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=';
+/** First spoken sentence min length before early TTS pipeline kicks in */
+const EARLY_TTS_MIN_CHARS = 12;
 
 function getAudioContextCtor(): typeof AudioContext {
   return (
@@ -51,6 +56,21 @@ function pickMimeType() {
 
 function streamIsLive(stream: MediaStream | null) {
   return Boolean(stream?.getAudioTracks().some((t) => t.readyState === 'live'));
+}
+
+/** MediaRecorder containers need their first cluster/init segment — never drop leading chunks. */
+function looksLikeMediaContainer(buf: ArrayBuffer): boolean {
+  if (buf.byteLength < 4) return false;
+  const u8 = new Uint8Array(buf.slice(0, 12));
+  // EBML / WebM
+  if (u8[0] === 0x1a && u8[1] === 0x45 && u8[2] === 0xdf && u8[3] === 0xa3) return true;
+  // RIFF / WAV
+  if (u8[0] === 0x52 && u8[1] === 0x49 && u8[2] === 0x46 && u8[3] === 0x46) return true;
+  // ISO BMFF (mp4/m4a) — "ftyp" at offset 4
+  if (u8[4] === 0x66 && u8[5] === 0x74 && u8[6] === 0x79 && u8[7] === 0x70) return true;
+  // Ogg
+  if (u8[0] === 0x4f && u8[1] === 0x67 && u8[2] === 0x67 && u8[3] === 0x53) return true;
+  return false;
 }
 
 async function streamChat(
@@ -105,7 +125,8 @@ async function streamChat(
   return full.trim();
 }
 
-export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
+export function useVoiceCall(options: UseVoiceCallOptions = {}) {
+  const onFatalError = options.onFatalError;
   const [phase, setPhase] = useState<VoicePhase>('idle');
   const [error, setError] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
@@ -165,14 +186,29 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     }
   }, []);
 
+  /** Keep one HTMLAudioElement alive — iOS unlock does not transfer to a new Audio(). */
+  const ensurePlaybackAudio = useCallback(() => {
+    let el = htmlAudioRef.current;
+    if (!el) {
+      el = new Audio();
+      el.preload = 'auto';
+      el.setAttribute('playsinline', 'true');
+      el.setAttribute('webkit-playsinline', 'true');
+      // Safari/iOS property (not only attribute)
+      (el as HTMLAudioElement & { playsInline?: boolean }).playsInline = true;
+      htmlAudioRef.current = el;
+    }
+    return el;
+  }, []);
+
   const stopHtmlAudio = useCallback(() => {
     const el = htmlAudioRef.current;
-    htmlAudioRef.current = null;
     if (el) {
       try {
         el.onended = null;
         el.onerror = null;
         el.pause();
+        // Keep element; clear src so we don't keep playing old blobs
         el.removeAttribute('src');
         el.load();
       } catch {
@@ -245,13 +281,19 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
       /* ignore */
     }
 
-    // Unlock HTMLMediaElement + speechSynthesis during the dial gesture (Safari)
+    // Prime the SAME HTMLAudioElement used for TTS (Safari unlock does not transfer)
     try {
-      const warm = new Audio(
-        'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=',
-      );
-      warm.volume = 0.01;
-      void warm.play().then(() => warm.pause()).catch(() => undefined);
+      const audio = ensurePlaybackAudio();
+      audio.volume = 0.01;
+      audio.src = SILENT_WAV;
+      void audio
+        .play()
+        .then(() => {
+          audio.pause();
+          audio.currentTime = 0;
+          audio.volume = 1;
+        })
+        .catch(() => undefined);
     } catch {
       /* ignore */
     }
@@ -266,7 +308,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
         /* ignore */
       }
     }
-  }, [stopKeepAlive]);
+  }, [ensurePlaybackAudio, stopKeepAlive]);
 
   const stopRecorderAsync = useCallback(async (): Promise<Blob | null> => {
     const recorder = mediaRecorderRef.current;
@@ -333,6 +375,8 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     }
 
     mediaRecorderRef.current = recorder;
+    // Keep every chunk — shifting idle chunks strips the WebM/MP4 init segment and
+    // Groq rejects the blob as invalid_media_file.
     recorder.ondataavailable = (e) => {
       if (e.data.size > 0) chunksRef.current.push(e.data);
     };
@@ -451,8 +495,6 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     }
   }, [setPhaseSafe, startRecorder]);
 
-  playNextRef.current = playNext;
-
   const pickBrowserVoice = useCallback(() => {
     if (browserVoiceRef.current) return browserVoiceRef.current;
     if (!window.speechSynthesis) return null;
@@ -469,7 +511,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
 
   const speakWithBrowser = useCallback(
     (text: string, signal: AbortSignal, session: number) =>
-      new Promise<void>((resolve) => {
+      new Promise<void>((resolve, reject) => {
         if (!window.speechSynthesis || session !== sessionRef.current) {
           resolve();
           return;
@@ -477,6 +519,10 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
 
         // Strip Orpheus-style [direction] tags so fallback voice stays consistent
         const clean = text.replace(/\[[^\]]+\]/g, ' ').replace(/\s+/g, ' ').trim();
+        if (!clean) {
+          resolve();
+          return;
+        }
         const utter = new SpeechSynthesisUtterance(clean);
         utter.rate = 1.02;
         utter.pitch = 1;
@@ -485,12 +531,13 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
         if (voice) utter.voice = voice;
 
         let done = false;
-        const finish = () => {
+        const finish = (err?: Error) => {
           if (done) return;
           done = true;
           signal.removeEventListener('abort', onAbort);
           playingRef.current = false;
-          resolve();
+          if (err) reject(err);
+          else resolve();
         };
 
         const onAbort = () => {
@@ -499,8 +546,15 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
         };
 
         signal.addEventListener('abort', onAbort);
-        utter.onend = finish;
-        utter.onerror = finish;
+        utter.onend = () => finish();
+        utter.onerror = (ev) => {
+          const code = (ev as SpeechSynthesisErrorEvent).error;
+          if (signal.aborted || code === 'interrupted' || code === 'canceled') {
+            finish();
+            return;
+          }
+          finish(new Error('speechSynthesis failed'));
+        };
 
         playingRef.current = true;
         setPhaseSafe('speaking');
@@ -509,7 +563,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     [pickBrowserVoice, setPhaseSafe],
   );
 
-  /** Prefer HTMLAudioElement — works after dial-gesture unlock on Safari where Web Audio stays silent. */
+  /** Prefer persistent HTMLAudioElement primed during dial gesture (Safari). */
   const playGroqWav = useCallback(
     async (blob: Blob, signal: AbortSignal, session: number) => {
       if (signal.aborted || !activeRef.current || session !== sessionRef.current) {
@@ -518,20 +572,17 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
       if (!blob.size) throw new Error('Empty TTS audio');
 
       stopHtmlAudio();
-      // Disable mic while AI talks — stops echo barge-in from killing playback
-      mediaStreamRef.current?.getAudioTracks().forEach((t) => {
-        t.enabled = false;
-      });
+      // Keep mic tracks enabled for barge-in; rely on echoCancellation + higher barge threshold
 
+      if (htmlAudioUrlRef.current) {
+        URL.revokeObjectURL(htmlAudioUrlRef.current);
+        htmlAudioUrlRef.current = null;
+      }
       const url = URL.createObjectURL(blob);
       htmlAudioUrlRef.current = url;
-      const audio = new Audio();
-      audio.preload = 'auto';
+      const audio = ensurePlaybackAudio();
       audio.volume = 1;
       audio.src = url;
-      audio.setAttribute('playsinline', 'true');
-      audio.setAttribute('webkit-playsinline', 'true');
-      htmlAudioRef.current = audio;
 
       await new Promise<void>((resolve, reject) => {
         let settled = false;
@@ -540,11 +591,16 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
           settled = true;
           signal.removeEventListener('abort', onAbort);
           playingRef.current = false;
-          stopHtmlAudio();
-          if (!mutedRef.current) {
-            mediaStreamRef.current?.getAudioTracks().forEach((t) => {
-              t.enabled = true;
-            });
+          try {
+            audio.onended = null;
+            audio.onerror = null;
+            audio.pause();
+          } catch {
+            /* ignore */
+          }
+          if (htmlAudioUrlRef.current) {
+            URL.revokeObjectURL(htmlAudioUrlRef.current);
+            htmlAudioUrlRef.current = null;
           }
           if (err) reject(err);
           else resolve();
@@ -567,10 +623,9 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
         void audio
           .play()
           .then(() => {
-            // playing
+            // playing on unlocked element
           })
           .catch(async (err) => {
-            // Fallback: Web Audio decode if element.play() blocked
             console.warn('HTMLAudio play blocked, trying Web Audio', err);
             try {
               let ctx = playbackCtxRef.current;
@@ -606,7 +661,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
           });
       });
     },
-    [setPhaseSafe, stopHtmlAudio],
+    [ensurePlaybackAudio, setPhaseSafe, stopHtmlAudio],
   );
 
   const fetchGroqSpeech = useCallback(async (text: string, signal: AbortSignal) => {
@@ -620,16 +675,17 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
   }, []);
 
   /**
-   * One TTS request per assistant turn (Orpheus is ~10 RPM — sentence spam causes
-   * mid-reply failures and a jarring switch to browser voice).
+   * Prefer Groq TTS; on any fetch/play failure always fall back to browser speech
+   * so the turn is never silent.
    */
   const speakFullReply = useCallback(
     async (text: string, signal: AbortSignal, session: number) => {
       const trimmed = text.replace(/\[[^\]]+\]/g, ' ').replace(/\s+/g, ' ').trim();
       if (!trimmed || signal.aborted || session !== sessionRef.current) return;
 
+      let playedOk = false;
+
       if (ttsModeRef.current !== 'browser') {
-        let lastStatus = 0;
         for (let attempt = 0; attempt < 2; attempt++) {
           if (signal.aborted || session !== sessionRef.current) return;
           try {
@@ -637,25 +693,30 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
               await new Promise((r) => setTimeout(r, 400));
             }
             const res = await fetchGroqSpeech(trimmed, signal);
-            lastStatus = res.status;
             if (res.ok) {
               const blob = await res.blob();
+              if (!blob.size) {
+                console.warn('TTS returned empty audio');
+                if (attempt === 0) continue;
+                break;
+              }
               try {
                 await playGroqWav(blob, signal, session);
                 ttsModeRef.current = 'groq';
+                playedOk = true;
                 return;
               } catch (playErr) {
                 if (signal.aborted || (playErr instanceof Error && playErr.message === 'aborted')) {
                   return;
                 }
                 console.warn('TTS audio play failed:', playErr);
+                setError('Audio playback failed — using device voice');
                 if (attempt === 0) continue;
                 break;
               }
             }
             const errBody = await res.json().catch(() => ({}));
             console.warn('TTS failed:', errBody.error || res.status);
-            // 429: skip long retry — server should already serve fallback audio
             if (attempt === 0 && res.status >= 500) continue;
             break;
           } catch (err) {
@@ -665,31 +726,33 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
             break;
           }
         }
-
-        // Already used Orpheus successfully this call — never flip voice mid-conversation
-        if (ttsModeRef.current === 'groq') {
-          console.warn('Skipping browser fallback to keep voice consistent', lastStatus);
-          return;
-        }
-        ttsModeRef.current = 'browser';
       }
 
-      if (ttsModeRef.current === 'browser') {
-        if (window.speechSynthesis && !window.speechSynthesis.getVoices().length) {
-          await new Promise<void>((r) => {
-            const done = () => {
-              window.speechSynthesis.removeEventListener('voiceschanged', done);
-              r();
-            };
-            window.speechSynthesis.addEventListener('voiceschanged', done);
-            setTimeout(done, 300);
-          });
-        }
-        pickBrowserVoice();
+      if (playedOk || signal.aborted || session !== sessionRef.current) return;
+
+      // Always audible fallback when Groq fetch/play fails (including mid-call)
+      if (window.speechSynthesis && !window.speechSynthesis.getVoices().length) {
+        await new Promise<void>((r) => {
+          const done = () => {
+            window.speechSynthesis.removeEventListener('voiceschanged', done);
+            r();
+          };
+          window.speechSynthesis.addEventListener('voiceschanged', done);
+          setTimeout(done, 300);
+        });
+      }
+      pickBrowserVoice();
+      try {
         await speakWithBrowser(trimmed, signal, session);
+        if (ttsModeRef.current === 'unset') ttsModeRef.current = 'browser';
+      } catch (err) {
+        if (signal.aborted) return;
+        const message = err instanceof Error ? err.message : 'Voice playback failed';
+        setError(message);
+        onFatalError?.(message);
       }
     },
-    [fetchGroqSpeech, pickBrowserVoice, playGroqWav, speakWithBrowser],
+    [fetchGroqSpeech, onFatalError, pickBrowserVoice, playGroqWav, speakWithBrowser],
   );
 
   const waitForPlaybackIdle = useCallback(
@@ -744,12 +807,29 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
       setError(null);
 
       try {
-        // Collect full reply first — one TTS call avoids Orpheus rate-limit voice flips
+        // Pipeline: speak first sentence as soon as it arrives; remainder after stream ends
+        let earlySpoken = '';
+        let remainder = '';
+        let earlySpeakPromise: Promise<void> | null = null;
+        let streamBuf = '';
+
         const full = await streamChat(
           messagesRef.current,
           controller.signal,
-          () => {
-            /* tokens buffered until complete */
+          (token) => {
+            if (earlySpoken) {
+              remainder += token;
+              return;
+            }
+            streamBuf += token;
+            const match = streamBuf.match(/^([\s\S]+?[.!?])(\s+|$)/);
+            if (match && match[1].trim().length >= EARLY_TTS_MIN_CHARS) {
+              earlySpoken = match[1].trim();
+              remainder = streamBuf.slice(match[0].length);
+              streamBuf = '';
+              setPhaseSafe(userText ? 'speaking' : 'greeting');
+              earlySpeakPromise = speakFullReply(earlySpoken, controller.signal, session);
+            }
           },
         );
 
@@ -767,7 +847,13 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
         }
 
         // Keep busy=true through TTS so mic barge-in cannot abort the speak fetch
-        if (full) {
+        if (earlySpeakPromise) {
+          await earlySpeakPromise;
+          const rest = (remainder + streamBuf).trim() || (full ? full.slice(earlySpoken.length).trim() : '');
+          if (rest && session === sessionRef.current && activeRef.current && !controller.signal.aborted) {
+            await speakFullReply(rest, controller.signal, session);
+          }
+        } else if (full) {
           setPhaseSafe(userText ? 'speaking' : 'greeting');
           await speakFullReply(full, controller.signal, session);
         }
@@ -809,8 +895,6 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     ],
   );
 
-  runAssistantTurnRef.current = runAssistantTurn;
-
   const finalizeSpeech = useCallback(async () => {
     if (!activeRef.current || busyRef.current || mutedRef.current || finalizeLockRef.current) {
       return;
@@ -842,6 +926,15 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
       return;
     }
 
+    const headerBuf = await blob.slice(0, 16).arrayBuffer();
+    if (!looksLikeMediaContainer(headerBuf)) {
+      console.warn('Discarding utterance — not a valid media container', blob.type, blob.size);
+      await startRecorder();
+      setPhaseSafe('listening');
+      finalizeLockRef.current = false;
+      return;
+    }
+
     busyRef.current = true;
     setPhaseSafe('thinking');
 
@@ -851,8 +944,10 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
 
     try {
       const form = new FormData();
-      const ext = blob.type.includes('mp4') ? 'm4a' : 'webm';
-      form.append('audio', blob, `utterance.${ext}`);
+      const isMp4 = /mp4|m4a|aac|mpeg/i.test(blob.type);
+      const ext = isMp4 ? 'm4a' : 'webm';
+      const mime = blob.type || (isMp4 ? 'audio/mp4' : 'audio/webm');
+      form.append('audio', new File([blob], `utterance.${ext}`, { type: mime }));
       const res = await fetch('/api/transcribe', {
         method: 'POST',
         body: form,
@@ -902,8 +997,6 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     }
   }, [setPhaseSafe, speakFullReply, startRecorder, stopRecorderAsync, waitForPlaybackIdle]);
 
-  finalizeSpeechRef.current = finalizeSpeech;
-
   const onVadTick = useCallback(() => {
     if (!activeRef.current || mutedRef.current) return;
 
@@ -911,11 +1004,17 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     const now = Date.now();
     const currentPhase = phaseRef.current;
 
-    // Adaptive noise floor while idle-listening
+    // Adaptive noise floor while idle-listening (hard upper clamp)
     if (currentPhase === 'listening' && !capturingRef.current && !busyRef.current) {
-      noiseFloorRef.current = noiseFloorRef.current * 0.95 + rms * 0.05;
+      noiseFloorRef.current = Math.min(
+        NOISE_FLOOR_MAX,
+        noiseFloorRef.current * 0.95 + rms * 0.05,
+      );
     }
-    const threshold = Math.max(SPEECH_THRESHOLD_MIN, noiseFloorRef.current * 3.2);
+    // Higher threshold while TTS plays so echo doesn't false-trigger barge-in
+    const threshold = playingRef.current
+      ? Math.max(SPEECH_THRESHOLD_MIN * 2.2, noiseFloorRef.current * 5)
+      : Math.max(SPEECH_THRESHOLD_MIN, noiseFloorRef.current * 3.2);
     const loud = rms >= threshold;
 
     // Only barge-in while audio is actually playing — not during chat/TTS fetch
@@ -1128,11 +1227,24 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
   }, [startRecorder, stopRecorderAsync]);
 
   useEffect(() => {
+    playNextRef.current = playNext;
+  }, [playNext]);
+
+  useEffect(() => {
+    runAssistantTurnRef.current = runAssistantTurn;
+  }, [runAssistantTurn]);
+
+  useEffect(() => {
+    finalizeSpeechRef.current = finalizeSpeech;
+  }, [finalizeSpeech]);
+
+  useEffect(() => {
     return () => {
       sessionRef.current += 1;
       activeRef.current = false;
       void tearDownMic();
       stopPlayback();
+      htmlAudioRef.current = null;
       if (playbackCtxRef.current && playbackCtxRef.current.state !== 'closed') {
         void playbackCtxRef.current.close().catch(() => undefined);
         playbackCtxRef.current = null;

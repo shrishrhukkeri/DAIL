@@ -27,7 +27,6 @@ function App() {
   const dialTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dialTokenRef = useRef(0);
   const numberRef = useRef(number);
-  numberRef.current = number;
 
   const clearDialTimer = useCallback(() => {
     if (dialTimerRef.current) {
@@ -35,6 +34,10 @@ function App() {
       dialTimerRef.current = null;
     }
   }, []);
+
+  useEffect(() => {
+    numberRef.current = number;
+  }, [number]);
 
   useEffect(() => () => clearDialTimer(), [clearDialTimer]);
 
