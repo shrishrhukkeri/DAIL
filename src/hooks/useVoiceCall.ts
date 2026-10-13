@@ -114,8 +114,14 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
   const abortRef = useRef<AbortController | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  /** TTS playback only — never share with mic (Safari mutes page mic otherwise). */
+  /** TTS / unlock AudioContext — never share with mic (Safari mutes page mic otherwise). */
   const playbackCtxRef = useRef<AudioContext | null>(null);
+  /** Keeps playbackCtx running between dial gesture and delayed TTS (iOS suspends idle contexts). */
+  const keepAliveOscRef = useRef<OscillatorNode | null>(null);
+  const keepAliveGainRef = useRef<GainNode | null>(null);
+  /** HTMLAudioElement path — reliable for Groq WAV on Safari. */
+  const htmlAudioRef = useRef<HTMLAudioElement | null>(null);
+  const htmlAudioUrlRef = useRef<string | null>(null);
   /** VAD / analyser only — not connected to destination. */
   const micCtxRef = useRef<AudioContext | null>(null);
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -159,6 +165,26 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     }
   }, []);
 
+  const stopHtmlAudio = useCallback(() => {
+    const el = htmlAudioRef.current;
+    htmlAudioRef.current = null;
+    if (el) {
+      try {
+        el.onended = null;
+        el.onerror = null;
+        el.pause();
+        el.removeAttribute('src');
+        el.load();
+      } catch {
+        /* ignore */
+      }
+    }
+    if (htmlAudioUrlRef.current) {
+      URL.revokeObjectURL(htmlAudioUrlRef.current);
+      htmlAudioUrlRef.current = null;
+    }
+  }, []);
+
   const stopPlayback = useCallback(() => {
     activeSourcesRef.current.forEach((src) => {
       try {
@@ -171,10 +197,27 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     });
     activeSourcesRef.current = [];
     audioQueueRef.current = [];
+    stopHtmlAudio();
     playingRef.current = false;
-    if (typeof window !== 'undefined' && window.speechSynthesis) {
+    if (typeof window !== 'undefined' && window.speechSynthesis?.speaking) {
       window.speechSynthesis.cancel();
     }
+  }, [stopHtmlAudio]);
+
+  const stopKeepAlive = useCallback(() => {
+    try {
+      keepAliveOscRef.current?.stop();
+    } catch {
+      /* ignore */
+    }
+    try {
+      keepAliveOscRef.current?.disconnect();
+      keepAliveGainRef.current?.disconnect();
+    } catch {
+      /* ignore */
+    }
+    keepAliveOscRef.current = null;
+    keepAliveGainRef.current = null;
   }, []);
 
   /** Must run inside the dial button click (user gesture). */
@@ -186,17 +229,33 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     const ctx = playbackCtxRef.current;
     void ctx.resume();
 
-    const buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(ctx.destination);
+    // Inaudible keep-alive so iOS does not suspend the context before greeting TTS
+    stopKeepAlive();
     try {
-      source.start(0);
+      const gain = ctx.createGain();
+      gain.gain.value = 0.0001;
+      const osc = ctx.createOscillator();
+      osc.frequency.value = 20;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(0);
+      keepAliveOscRef.current = osc;
+      keepAliveGainRef.current = gain;
     } catch {
       /* ignore */
     }
 
-  }, []);
+    // Also unlock HTMLMediaElement playback (Safari)
+    try {
+      const warm = new Audio(
+        'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=',
+      );
+      warm.volume = 0.01;
+      void warm.play().then(() => warm.pause()).catch(() => undefined);
+    } catch {
+      /* ignore */
+    }
+  }, [stopKeepAlive]);
 
   const stopRecorderAsync = useCallback(async (): Promise<Blob | null> => {
     const recorder = mediaRecorderRef.current;
@@ -308,6 +367,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     abortRef.current = null;
     void tearDownMic();
     stopPlayback();
+    stopKeepAlive();
     // Keep playback context alive (suspended) so the next dial can resume under a gesture
     if (playbackCtxRef.current && playbackCtxRef.current.state !== 'closed') {
       void playbackCtxRef.current.suspend().catch(() => undefined);
@@ -318,7 +378,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     setMuted(false);
     setPhaseSafe('idle');
     setError(null);
-  }, [setPhaseSafe, stopPlayback, tearDownMic]);
+  }, [setPhaseSafe, stopKeepAlive, stopPlayback, tearDownMic]);
 
   const getRms = useCallback(() => {
     const analyser = analyserRef.current;
@@ -438,20 +498,94 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     [pickBrowserVoice, setPhaseSafe],
   );
 
-  const playGroqWav = useCallback(async (blob: Blob, signal: AbortSignal, session: number) => {
-    if (signal.aborted || !activeRef.current || session !== sessionRef.current) return;
-    let ctx = playbackCtxRef.current;
-    if (!ctx || ctx.state === 'closed') {
-      ctx = new (getAudioContextCtor())();
-      playbackCtxRef.current = ctx;
-    }
-    if (ctx.state === 'suspended') await ctx.resume();
-    const arrayBuf = await blob.arrayBuffer();
-    const audioBuf = await ctx.decodeAudioData(arrayBuf.slice(0));
-    if (signal.aborted || !activeRef.current || session !== sessionRef.current) return;
-    audioQueueRef.current.push(audioBuf);
-    playNextRef.current();
-  }, []);
+  /** Prefer HTMLAudioElement — works after dial-gesture unlock on Safari where Web Audio stays silent. */
+  const playGroqWav = useCallback(
+    async (blob: Blob, signal: AbortSignal, session: number) => {
+      if (signal.aborted || !activeRef.current || session !== sessionRef.current) {
+        throw new Error('aborted');
+      }
+      if (!blob.size) throw new Error('Empty TTS audio');
+
+      stopHtmlAudio();
+      const url = URL.createObjectURL(blob);
+      htmlAudioUrlRef.current = url;
+      const audio = new Audio();
+      audio.preload = 'auto';
+      audio.src = url;
+      audio.setAttribute('playsinline', 'true');
+      audio.setAttribute('webkit-playsinline', 'true');
+      htmlAudioRef.current = audio;
+
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = (err?: Error) => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener('abort', onAbort);
+          playingRef.current = false;
+          stopHtmlAudio();
+          if (err) reject(err);
+          else resolve();
+        };
+        const onAbort = () => {
+          try {
+            audio.pause();
+          } catch {
+            /* ignore */
+          }
+          finish(new Error('aborted'));
+        };
+
+        signal.addEventListener('abort', onAbort);
+        audio.onended = () => finish();
+        audio.onerror = () => finish(new Error('HTMLAudio playback failed'));
+
+        playingRef.current = true;
+        setPhaseSafe('speaking');
+        void audio
+          .play()
+          .then(() => {
+            // playing
+          })
+          .catch(async (err) => {
+            // Fallback: Web Audio decode if element.play() blocked
+            console.warn('HTMLAudio play blocked, trying Web Audio', err);
+            try {
+              let ctx = playbackCtxRef.current;
+              if (!ctx || ctx.state === 'closed') {
+                ctx = new (getAudioContextCtor())();
+                playbackCtxRef.current = ctx;
+              }
+              if (ctx.state === 'suspended') await ctx.resume();
+              const arrayBuf = await blob.arrayBuffer();
+              const audioBuf = await ctx.decodeAudioData(arrayBuf.slice(0));
+              if (signal.aborted || session !== sessionRef.current) {
+                finish(new Error('aborted'));
+                return;
+              }
+              stopHtmlAudio();
+              audioQueueRef.current.push(audioBuf);
+              playNextRef.current();
+              const wait = () => {
+                if (
+                  signal.aborted ||
+                  session !== sessionRef.current ||
+                  (!playingRef.current && audioQueueRef.current.length === 0)
+                ) {
+                  finish(signal.aborted ? new Error('aborted') : undefined);
+                  return;
+                }
+                setTimeout(wait, 40);
+              };
+              wait();
+            } catch (fallbackErr) {
+              finish(fallbackErr instanceof Error ? fallbackErr : new Error('playback failed'));
+            }
+          });
+      });
+    },
+    [setPhaseSafe, stopHtmlAudio],
+  );
 
   const fetchGroqSpeech = useCallback(async (text: string, signal: AbortSignal) => {
     const res = await fetch('/api/speak', {
@@ -483,10 +617,20 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
             const res = await fetchGroqSpeech(trimmed, signal);
             lastStatus = res.status;
             if (res.ok) {
-              ttsModeRef.current = 'groq';
               const blob = await res.blob();
-              await playGroqWav(blob, signal, session);
-              return;
+              try {
+                await playGroqWav(blob, signal, session);
+                ttsModeRef.current = 'groq';
+                return;
+              } catch (playErr) {
+                if (signal.aborted || (playErr instanceof Error && playErr.message === 'aborted')) {
+                  return;
+                }
+                console.warn('Groq audio play failed:', playErr);
+                // Do not lock groq mode until playback actually worked
+                if (attempt === 0) continue;
+                break;
+              }
             }
             const errBody = await res.json().catch(() => ({}));
             console.warn('Groq TTS failed:', errBody.error || res.status);
@@ -501,7 +645,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
           }
         }
 
-        // Already used Orpheus this call — never flip to browser mid-conversation
+        // Already used Orpheus successfully this call — never flip voice mid-conversation
         if (ttsModeRef.current === 'groq') {
           console.warn('Skipping browser fallback to keep voice consistent', lastStatus);
           return;
@@ -601,12 +745,13 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
           }
         }
 
-        busyRef.current = false;
+        // Keep busy=true through TTS so mic barge-in cannot abort the speak fetch
         if (full) {
           setPhaseSafe(userText ? 'speaking' : 'greeting');
           await speakFullReply(full, controller.signal, session);
         }
         await waitForPlaybackIdle(session, controller.signal);
+        busyRef.current = false;
 
         if (
           session === sessionRef.current &&
@@ -752,10 +897,8 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     const threshold = Math.max(SPEECH_THRESHOLD_MIN, noiseFloorRef.current * 3.2);
     const loud = rms >= threshold;
 
-    const aiAudible =
-      playingRef.current || currentPhase === 'speaking' || currentPhase === 'greeting';
-
-    if (aiAudible && !busyRef.current) {
+    // Only barge-in while audio is actually playing — not during chat/TTS fetch
+    if (playingRef.current) {
       if (loud) {
         if (!bargeStartedAtRef.current) bargeStartedAtRef.current = now;
         if (now - (bargeStartedAtRef.current || now) >= BARGE_IN_MS) {
@@ -778,6 +921,10 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
       } else {
         bargeStartedAtRef.current = null;
       }
+      return;
+    }
+
+    if (currentPhase === 'speaking' || currentPhase === 'greeting' || currentPhase === 'thinking') {
       return;
     }
 
