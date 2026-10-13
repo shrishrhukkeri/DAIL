@@ -19,7 +19,7 @@ const CHAT_MODEL = process.env.GROQ_CHAT_MODEL || 'openai/gpt-oss-20b';
 const STT_MODEL = process.env.GROQ_STT_MODEL || 'whisper-large-v3-turbo';
 const TTS_MODEL = process.env.GROQ_TTS_MODEL || 'canopylabs/orpheus-v1-english';
 const TTS_VOICE = process.env.GROQ_TTS_VOICE || 'austin';
-const CHAT_MAX_TOKENS = Number(process.env.GROQ_CHAT_MAX_TOKENS || 280);
+const CHAT_MAX_TOKENS = Number(process.env.GROQ_CHAT_MAX_TOKENS || 300);
 const CHAT_HISTORY_LIMIT = Number(process.env.GROQ_CHAT_HISTORY_LIMIT || 8);
 
 const SYSTEM_PROMPT =

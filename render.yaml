@@ -15,7 +15,7 @@ services:
       - key: GROQ_CHAT_MODEL
         value: openai/gpt-oss-20b
       - key: GROQ_CHAT_MAX_TOKENS
-        value: "280"
+        value: "300"
       - key: GROQ_CHAT_HISTORY_LIMIT
         value: "8"
       - key: GROQ_STT_MODEL
