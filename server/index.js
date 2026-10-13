@@ -152,22 +152,34 @@ app.post('/api/speak', requireGroq, async (req, res) => {
   try {
     // Always the same Orpheus persona — strip LLM vocal-direction tags for steadier delivery
     const cleaned = text.replace(/\[[^\]]+\]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 2000);
+    if (!cleaned) {
+      return res.status(400).json({ error: 'text is empty after cleanup' });
+    }
+
     const response = await req.groq.audio.speech.create({
       model: TTS_MODEL,
       voice: TTS_VOICE,
-      input: cleaned || text.slice(0, 2000),
+      input: cleaned,
       response_format: 'wav',
     });
 
     const buffer = Buffer.from(await response.arrayBuffer());
+    if (!buffer.length) {
+      return res.status(502).json({ error: 'Empty TTS audio from provider', code: 'empty_audio' });
+    }
     res.setHeader('Content-Type', 'audio/wav');
     res.setHeader('Content-Length', buffer.length);
+    res.setHeader('Cache-Control', 'no-store');
     res.send(buffer);
   } catch (err) {
     console.error('speak error:', err);
     const message = err?.message || 'TTS failed';
     const code = err?.error?.error?.code || err?.code || 'tts_failed';
-    const status = message.includes('terms acceptance') || code === 'model_terms_required' ? 403 : 500;
+    const statusNum = err?.status || err?.statusCode || err?.error?.status;
+    let status = 500;
+    if (message.includes('terms acceptance') || code === 'model_terms_required') status = 403;
+    else if (statusNum === 429 || /rate.?limit/i.test(message)) status = 429;
+    else if (statusNum >= 400 && statusNum < 600) status = statusNum;
     res.status(status).json({
       error: message,
       code: status === 403 ? 'model_terms_required' : code,

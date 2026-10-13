@@ -139,7 +139,10 @@ export const useAudio = () => {
         currentAudio.current.pause();
         currentAudio.current = null;
     }
-    window.speechSynthesis.cancel();
+    // Only cancel if speechSynthesis is already speaking — avoid Safari mic-mute quirks
+    if (typeof window !== 'undefined' && window.speechSynthesis?.speaking) {
+      window.speechSynthesis.cancel();
+    }
   }, []);
 
   return { playDTMF, playBusyTone, playRingtone, playVoiceClue, playFailureMessage, stopAllAudio, playEndBeep };

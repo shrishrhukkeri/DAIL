@@ -140,13 +140,8 @@ export const CallScreen: React.FC<CallScreenProps> = ({
                   width: '50px',
                   height: '50px',
                   borderRadius: '50%',
-                  background:
-                    isMic && muted
-                      ? 'rgba(255, 59, 48, 0.35)'
-                      : isMic && listening
-                        ? 'rgba(52, 199, 89, 0.35)'
-                        : 'rgba(255,255,255,0.1)',
-                  border: isMic && listening ? '1px solid #34c759' : 'none',
+                  background: isMic && muted ? 'rgba(255, 59, 48, 0.45)' : 'rgba(255,255,255,0.1)',
+                  border: isMic && muted ? '1px solid #ff3b30' : 'none',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
