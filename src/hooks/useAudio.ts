@@ -12,11 +12,11 @@ export const useAudio = () => {
   const currentAudio = useRef<HTMLAudioElement | null>(null);
 
   const initAudio = () => {
-    if (!audioCtx.current) {
+    if (!audioCtx.current || audioCtx.current.state === 'closed') {
       audioCtx.current = new (window.AudioContext || (window as any).webkitAudioContext)();
     }
     if (audioCtx.current.state === 'suspended') {
-      audioCtx.current.resume();
+      void audioCtx.current.resume();
     }
   };
 

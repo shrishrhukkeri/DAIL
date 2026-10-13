@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { Phone } from 'lucide-react';
 import { AnimatePresence } from 'framer-motion';
 import { Keypad } from './components/Keypad';
@@ -14,6 +14,20 @@ function App() {
   const [callStatus, setCallStatus] = useState<'idle' | 'calling' | 'connected' | 'failed'>('idle');
   const { playDTMF, playRingtone, playFailureMessage, stopAllAudio, playEndBeep } = useAudio();
   const { phase, error, muted, unlockAudio, startCall, hangup, toggleMute } = useVoiceCall();
+
+  const dialTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const dialTokenRef = useRef(0);
+  const numberRef = useRef(number);
+  numberRef.current = number;
+
+  const clearDialTimer = useCallback(() => {
+    if (dialTimerRef.current) {
+      clearTimeout(dialTimerRef.current);
+      dialTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => () => clearDialTimer(), [clearDialTimer]);
 
   const handleKeyPress = useCallback((key: string) => {
     if (number.length < 15) {
@@ -35,16 +49,23 @@ function App() {
   }, [playEndBeep, stopAllAudio]);
 
   const startDial = () => {
-    if (!number) return;
+    if (!numberRef.current) return;
 
-    // Must run in the click handler — unlocks autoplay for async TTS on Render/mobile
+    clearDialTimer();
+    const token = ++dialTokenRef.current;
+
+    // Must run in the click handler — unlocks autoplay for async TTS
     unlockAudio();
 
     setCallStatus('calling');
     playRingtone();
 
-    setTimeout(() => {
-      if (number === AI_NUMBER) {
+    dialTimerRef.current = setTimeout(() => {
+      dialTimerRef.current = null;
+      // Ignore stale timers from a previous dial / hangup
+      if (token !== dialTokenRef.current) return;
+
+      if (numberRef.current === AI_NUMBER) {
         setCallStatus('connected');
         void startCall();
       } else {
@@ -55,6 +76,8 @@ function App() {
   };
 
   const endCall = () => {
+    dialTokenRef.current += 1;
+    clearDialTimer();
     hangup();
     stopAllAudio();
     setCallStatus('idle');

@@ -17,13 +17,9 @@ type UseVoiceCallOptions = {
   onFatalError?: (message: string) => void;
 };
 
-/** RMS above this counts as speech (echoCancellation keeps TTS quieter). */
 const SPEECH_THRESHOLD = 0.018;
-/** Wait after you stop talking before sending the turn. */
 const SILENCE_MS = 550;
-/** Ignore blips shorter than this. */
 const MIN_SPEECH_MS = 280;
-/** Speech while AI is talking interrupts playback. */
 const BARGE_IN_MS = 180;
 const VAD_INTERVAL_MS = 40;
 
@@ -41,6 +37,21 @@ function splitSentences(buffer: string): { complete: string[]; rest: string } {
   }
 
   return { complete, rest: buffer.slice(lastIndex) };
+}
+
+function getAudioContextCtor(): typeof AudioContext {
+  return (
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+  );
+}
+
+function pickMimeType() {
+  if (typeof MediaRecorder === 'undefined') return '';
+  if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) return 'audio/webm;codecs=opus';
+  if (MediaRecorder.isTypeSupported('audio/webm')) return 'audio/webm';
+  if (MediaRecorder.isTypeSupported('audio/mp4')) return 'audio/mp4';
+  return '';
 }
 
 async function streamChat(
@@ -95,15 +106,7 @@ async function streamChat(
   return full.trim();
 }
 
-function pickMimeType() {
-  if (typeof MediaRecorder === 'undefined') return '';
-  if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) return 'audio/webm;codecs=opus';
-  if (MediaRecorder.isTypeSupported('audio/webm')) return 'audio/webm';
-  if (MediaRecorder.isTypeSupported('audio/mp4')) return 'audio/mp4';
-  return '';
-}
-
-export function useVoiceCall(options: UseVoiceCallOptions = {}) {
+export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
   const [phase, setPhase] = useState<VoicePhase>('idle');
   const [error, setError] = useState<string | null>(null);
   const [muted, setMuted] = useState(false);
@@ -112,10 +115,8 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
   const abortRef = useRef<AbortController | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  /** Mic analysis context (may share playback ctx). */
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  /** Kept alive across the ringtone delay so TTS isn't blocked by autoplay. */
   const playbackCtxRef = useRef<AudioContext | null>(null);
+  const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const audioQueueRef = useRef<AudioBuffer[]>([]);
@@ -125,7 +126,6 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
   const speakChainRef = useRef<Promise<void>>(Promise.resolve());
   const phaseRef = useRef<VoicePhase>('idle');
   const mutedRef = useRef(false);
-  /** True only while STT/LLM request is in flight (not during TTS playback). */
   const busyRef = useRef(false);
   const capturingRef = useRef(false);
   const speechStartedAtRef = useRef<number | null>(null);
@@ -134,13 +134,20 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
   const vadTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const mimeTypeRef = useRef('');
   const finalizeLockRef = useRef(false);
+  /** Monotonic session id — ignores stale async work from a previous call/turn. */
+  const sessionRef = useRef(0);
 
   const runAssistantTurnRef = useRef<(userText?: string) => Promise<void>>(async () => undefined);
   const finalizeSpeechRef = useRef<() => Promise<void>>(async () => undefined);
+  const playNextRef = useRef<() => void>(() => undefined);
 
   const setPhaseSafe = useCallback((next: VoicePhase) => {
     phaseRef.current = next;
     setPhase(next);
+  }, []);
+
+  const resetSpeakChain = useCallback(() => {
+    speakChainRef.current = Promise.resolve();
   }, []);
 
   const stopPlayback = useCallback(() => {
@@ -161,16 +168,15 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     }
   }, []);
 
-  /** Call from the dial button click (user gesture) before any setTimeout. */
+  /** Must run inside the dial button click (user gesture). */
   const unlockAudio = useCallback(() => {
-    const AC = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const AC = getAudioContextCtor();
     if (!playbackCtxRef.current || playbackCtxRef.current.state === 'closed') {
       playbackCtxRef.current = new AC();
     }
     const ctx = playbackCtxRef.current;
     void ctx.resume();
 
-    // Silent buffer "primes" autoplay so later async TTS can play
     const buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
     const source = ctx.createBufferSource();
     source.buffer = buffer;
@@ -181,9 +187,8 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
       /* ignore */
     }
 
-    if (typeof window !== 'undefined' && window.speechSynthesis) {
+    if (window.speechSynthesis) {
       window.speechSynthesis.cancel();
-      // Some browsers need speak() once under a gesture
       const warm = new SpeechSynthesisUtterance(' ');
       warm.volume = 0;
       window.speechSynthesis.speak(warm);
@@ -191,60 +196,123 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     }
   }, []);
 
-  const stopRecorderOnly = useCallback(() => {
+  const stopRecorderAsync = useCallback(async (): Promise<Blob | null> => {
     const recorder = mediaRecorderRef.current;
     mediaRecorderRef.current = null;
-    if (recorder && recorder.state !== 'inactive') {
-      try {
-        recorder.ondataavailable = null;
-        recorder.onstop = null;
-        recorder.stop();
-      } catch {
-        /* ignore */
-      }
-    }
-    chunksRef.current = [];
     capturingRef.current = false;
     speechStartedAtRef.current = null;
     silenceStartedAtRef.current = null;
     bargeStartedAtRef.current = null;
+
+    if (!recorder) {
+      chunksRef.current = [];
+      return null;
+    }
+
+    if (recorder.state === 'inactive') {
+      const type = recorder.mimeType || mimeTypeRef.current || 'audio/webm';
+      const leftover = chunksRef.current;
+      chunksRef.current = [];
+      return leftover.length ? new Blob(leftover, { type }) : null;
+    }
+
+    const blob = await new Promise<Blob | null>((resolve) => {
+      const finish = () => {
+        const type = recorder.mimeType || mimeTypeRef.current || 'audio/webm';
+        const out = new Blob(chunksRef.current, { type });
+        chunksRef.current = [];
+        resolve(out.size > 800 ? out : null);
+      };
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunksRef.current.push(e.data);
+      };
+      recorder.onstop = finish;
+      try {
+        recorder.requestData?.();
+        recorder.stop();
+      } catch {
+        chunksRef.current = [];
+        resolve(null);
+      }
+    });
+
+    return blob;
   }, []);
 
-  const tearDownMic = useCallback(() => {
+  const startRecorder = useCallback(async () => {
+    const stream = mediaStreamRef.current;
+    if (!stream || !activeRef.current || mutedRef.current) return;
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') return;
+
+    // Ensure previous recorder fully stopped (Chrome rejects overlapping recorders)
+    await stopRecorderAsync();
+    if (!activeRef.current || !mediaStreamRef.current) return;
+
+    chunksRef.current = [];
+    const mimeType = mimeTypeRef.current;
+    let recorder: MediaRecorder;
+    try {
+      recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType })
+        : new MediaRecorder(stream);
+    } catch (err) {
+      console.error('MediaRecorder create failed', err);
+      return;
+    }
+
+    mediaRecorderRef.current = recorder;
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) chunksRef.current.push(e.data);
+    };
+    try {
+      recorder.start(100);
+    } catch (err) {
+      console.error('MediaRecorder start failed', err);
+      mediaRecorderRef.current = null;
+      return;
+    }
+    capturingRef.current = false;
+    speechStartedAtRef.current = null;
+    silenceStartedAtRef.current = null;
+  }, [stopRecorderAsync]);
+
+  const tearDownMic = useCallback(async () => {
     if (vadTimerRef.current) {
       clearInterval(vadTimerRef.current);
       vadTimerRef.current = null;
     }
-    stopRecorderOnly();
+    await stopRecorderAsync();
+    try {
+      micSourceRef.current?.disconnect();
+    } catch {
+      /* ignore */
+    }
+    micSourceRef.current = null;
+    analyserRef.current = null;
     mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
     mediaStreamRef.current = null;
-    analyserRef.current = null;
-    // Don't close playbackCtxRef here — it must stay unlocked for TTS
-    if (audioCtxRef.current && audioCtxRef.current !== playbackCtxRef.current) {
-      void audioCtxRef.current.close().catch(() => undefined);
-    }
-    audioCtxRef.current = null;
-  }, [stopRecorderOnly]);
+  }, [stopRecorderAsync]);
 
   const hangup = useCallback(() => {
+    sessionRef.current += 1;
     activeRef.current = false;
     busyRef.current = false;
     finalizeLockRef.current = false;
     abortRef.current?.abort();
     abortRef.current = null;
-    tearDownMic();
+    void tearDownMic();
     stopPlayback();
-    if (playbackCtxRef.current) {
-      void playbackCtxRef.current.close().catch(() => undefined);
-      playbackCtxRef.current = null;
+    // Keep AudioContext alive (suspended) so the next dial can resume it under a gesture
+    if (playbackCtxRef.current && playbackCtxRef.current.state !== 'closed') {
+      void playbackCtxRef.current.suspend().catch(() => undefined);
     }
     messagesRef.current = [];
-    speakChainRef.current = Promise.resolve();
+    resetSpeakChain();
     mutedRef.current = false;
     setMuted(false);
     setPhaseSafe('idle');
     setError(null);
-  }, [setPhaseSafe, stopPlayback, tearDownMic]);
+  }, [resetSpeakChain, setPhaseSafe, stopPlayback, tearDownMic]);
 
   const getRms = useCallback(() => {
     const analyser = analyserRef.current;
@@ -259,62 +327,13 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     return Math.sqrt(sum / data.length);
   }, []);
 
-  const startRecorder = useCallback(() => {
-    const stream = mediaStreamRef.current;
-    if (!stream || !activeRef.current || mutedRef.current) return;
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') return;
-
-    chunksRef.current = [];
-    const mimeType = mimeTypeRef.current;
-    const recorder = mimeType
-      ? new MediaRecorder(stream, { mimeType })
-      : new MediaRecorder(stream);
-
-    mediaRecorderRef.current = recorder;
-    recorder.ondataavailable = (e) => {
-      if (e.data.size > 0) chunksRef.current.push(e.data);
-    };
-    recorder.start(100);
-    capturingRef.current = false;
-    speechStartedAtRef.current = null;
-    silenceStartedAtRef.current = null;
-  }, []);
-
-  const stopRecorderToBlob = useCallback(async (): Promise<Blob | null> => {
-    const recorder = mediaRecorderRef.current;
-    if (!recorder || recorder.state === 'inactive') {
-      chunksRef.current = [];
-      return null;
-    }
-
-    const blob = await new Promise<Blob | null>((resolve) => {
-      recorder.onstop = () => {
-        const type = recorder.mimeType || mimeTypeRef.current || 'audio/webm';
-        const out = new Blob(chunksRef.current, { type });
-        chunksRef.current = [];
-        resolve(out.size > 800 ? out : null);
-      };
-      try {
-        recorder.stop();
-      } catch {
-        resolve(null);
-      }
-    });
-
-    mediaRecorderRef.current = null;
-    capturingRef.current = false;
-    speechStartedAtRef.current = null;
-    silenceStartedAtRef.current = null;
-    return blob;
-  }, []);
-
   const playNext = useCallback(() => {
     if (playingRef.current) return;
     const next = audioQueueRef.current.shift();
     const ctx = playbackCtxRef.current;
-    if (!next || !ctx) {
+    if (!next || !ctx || ctx.state === 'closed') {
       if (activeRef.current && !busyRef.current && phaseRef.current === 'speaking') {
-        startRecorder();
+        void startRecorder();
         setPhaseSafe('listening');
       }
       return;
@@ -329,10 +348,13 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     source.connect(ctx.destination);
     activeSourcesRef.current.push(source);
 
+    let finished = false;
     const finish = () => {
+      if (finished) return;
+      finished = true;
       activeSourcesRef.current = activeSourcesRef.current.filter((s) => s !== source);
       playingRef.current = false;
-      playNext();
+      playNextRef.current();
     };
     source.onended = finish;
     try {
@@ -342,10 +364,12 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     }
   }, [setPhaseSafe, startRecorder]);
 
+  playNextRef.current = playNext;
+
   const speakWithBrowser = useCallback(
-    (text: string, signal: AbortSignal) =>
+    (text: string, signal: AbortSignal, session: number) =>
       new Promise<void>((resolve) => {
-        if (!window.speechSynthesis) {
+        if (!window.speechSynthesis || session !== sessionRef.current) {
           resolve();
           return;
         }
@@ -353,8 +377,11 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
         const utter = new SpeechSynthesisUtterance(text);
         utter.rate = 1.05;
         utter.pitch = 1;
+        let done = false;
 
         const finish = () => {
+          if (done) return;
+          done = true;
           signal.removeEventListener('abort', onAbort);
           playingRef.current = false;
           resolve();
@@ -377,13 +404,15 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
   );
 
   const enqueueSpeech = useCallback(
-    (text: string, signal: AbortSignal) => {
+    (text: string, signal: AbortSignal, session: number) => {
       const trimmed = text.trim();
-      if (!trimmed || signal.aborted) return;
+      if (!trimmed || signal.aborted || session !== sessionRef.current) return;
 
       speakChainRef.current = speakChainRef.current
+        .catch(() => undefined)
         .then(async () => {
-          if (signal.aborted || !activeRef.current) return;
+          if (signal.aborted || !activeRef.current || session !== sessionRef.current) return;
+
           const res = await fetch('/api/speak', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -393,58 +422,68 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
 
           if (!res.ok) {
             const errBody = await res.json().catch(() => ({}));
-            // Orpheus requires one-time terms acceptance — fall back so the call still talks
             console.warn('Groq TTS unavailable, using browser voice:', errBody.error || res.status);
-            if (errBody.code === 'model_terms_required') {
-              setError('Accept Orpheus terms in Groq console for higher-quality voice (using browser TTS for now)');
-            }
-            await speakWithBrowser(trimmed, signal);
-            if (
-              activeRef.current &&
-              !signal.aborted &&
-              !busyRef.current &&
-              audioQueueRef.current.length === 0
-            ) {
-              startRecorder();
-              setPhaseSafe('listening');
-            }
+            await speakWithBrowser(trimmed, signal, session);
             return;
           }
 
           const blob = await res.blob();
-          if (signal.aborted || !activeRef.current) return;
+          if (signal.aborted || !activeRef.current || session !== sessionRef.current) return;
 
-          const ctx = playbackCtxRef.current;
-          if (!ctx) {
-            console.warn('Playback AudioContext missing — call unlockAudio() on dial');
-            return;
+          let ctx = playbackCtxRef.current;
+          if (!ctx || ctx.state === 'closed') {
+            ctx = new (getAudioContextCtor())();
+            playbackCtxRef.current = ctx;
           }
           await ctx.resume();
           const arrayBuf = await blob.arrayBuffer();
           const audioBuf = await ctx.decodeAudioData(arrayBuf.slice(0));
-          if (signal.aborted || !activeRef.current) return;
+          if (signal.aborted || !activeRef.current || session !== sessionRef.current) return;
           audioQueueRef.current.push(audioBuf);
-          playNext();
+          playNextRef.current();
         })
         .catch((err) => {
-          if (signal.aborted) return;
+          if (signal.aborted || session !== sessionRef.current) return;
           console.error(err);
         });
     },
-    [playNext, setPhaseSafe, speakWithBrowser, startRecorder],
+    [speakWithBrowser],
+  );
+
+  const waitForPlaybackIdle = useCallback(
+    (session: number, signal: AbortSignal) =>
+      new Promise<void>((resolve) => {
+        const check = () => {
+          if (
+            session !== sessionRef.current ||
+            !activeRef.current ||
+            signal.aborted ||
+            (!playingRef.current && audioQueueRef.current.length === 0)
+          ) {
+            resolve();
+            return;
+          }
+          setTimeout(check, 40);
+        };
+        check();
+      }),
+    [],
   );
 
   const runAssistantTurn = useCallback(
     async (userText?: string) => {
       if (!activeRef.current) return;
+      const session = sessionRef.current;
 
       const controller = new AbortController();
       abortRef.current?.abort();
       abortRef.current = controller;
       stopPlayback();
-      speakChainRef.current = Promise.resolve();
+      resetSpeakChain();
       busyRef.current = true;
-      stopRecorderOnly();
+      await stopRecorderAsync();
+
+      if (session !== sessionRef.current || !activeRef.current) return;
 
       if (userText?.trim()) {
         messagesRef.current = [
@@ -469,17 +508,20 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
           messagesRef.current,
           controller.signal,
           (token) => {
+            if (session !== sessionRef.current) return;
             sentenceBuffer += token;
             const { complete, rest } = splitSentences(sentenceBuffer);
             sentenceBuffer = rest;
             for (const sentence of complete) {
-              enqueueSpeech(sentence, controller.signal);
+              enqueueSpeech(sentence, controller.signal, session);
             }
           },
         );
 
+        if (session !== sessionRef.current || !activeRef.current) return;
+
         if (sentenceBuffer.trim()) {
-          enqueueSpeech(sentenceBuffer, controller.signal);
+          enqueueSpeech(sentenceBuffer, controller.signal, session);
         }
 
         if (full) {
@@ -493,61 +535,70 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
           }
         }
 
-        // LLM done — allow barge-in while audio plays
         busyRef.current = false;
-        await speakChainRef.current;
+        await speakChainRef.current.catch(() => undefined);
+        await waitForPlaybackIdle(session, controller.signal);
 
-        await new Promise<void>((resolve) => {
-          const check = () => {
-            if (
-              !activeRef.current ||
-              controller.signal.aborted ||
-              (!playingRef.current && audioQueueRef.current.length === 0)
-            ) {
-              resolve();
-              return;
-            }
-            setTimeout(check, 50);
-          };
-          check();
-        });
-
-        if (activeRef.current && !controller.signal.aborted && !mutedRef.current) {
-          startRecorder();
+        if (
+          session === sessionRef.current &&
+          activeRef.current &&
+          !controller.signal.aborted &&
+          !mutedRef.current
+        ) {
+          await startRecorder();
           setPhaseSafe('listening');
         }
       } catch (err) {
         busyRef.current = false;
-        if (controller.signal.aborted || !activeRef.current) return;
+        if (controller.signal.aborted || !activeRef.current || session !== sessionRef.current) {
+          return;
+        }
         const message = err instanceof Error ? err.message : 'Call failed';
         setError(message);
-        options.onFatalError?.(message);
-        if (activeRef.current) {
-          startRecorder();
-          setPhaseSafe('listening');
+        await startRecorder();
+        setPhaseSafe('listening');
+      } finally {
+        if (session === sessionRef.current) {
+          busyRef.current = false;
+          finalizeLockRef.current = false;
         }
       }
     },
-    [enqueueSpeech, options, setPhaseSafe, startRecorder, stopPlayback, stopRecorderOnly],
+    [
+      enqueueSpeech,
+      resetSpeakChain,
+      setPhaseSafe,
+      startRecorder,
+      stopPlayback,
+      stopRecorderAsync,
+      waitForPlaybackIdle,
+    ],
   );
 
   runAssistantTurnRef.current = runAssistantTurn;
 
   const finalizeSpeech = useCallback(async () => {
-    if (!activeRef.current || busyRef.current || mutedRef.current || finalizeLockRef.current) return;
+    if (!activeRef.current || busyRef.current || mutedRef.current || finalizeLockRef.current) {
+      return;
+    }
     finalizeLockRef.current = true;
+    const session = sessionRef.current;
 
     const started = speechStartedAtRef.current;
     if (!started || Date.now() - started < MIN_SPEECH_MS) {
-      stopRecorderOnly();
-      startRecorder();
+      await startRecorder();
       finalizeLockRef.current = false;
       return;
     }
 
-    const blob = await stopRecorderToBlob();
+    const blob = await stopRecorderAsync();
+    if (session !== sessionRef.current || !activeRef.current) {
+      finalizeLockRef.current = false;
+      return;
+    }
+
     if (!blob) {
-      startRecorder();
+      await startRecorder();
       setPhaseSafe('listening');
       finalizeLockRef.current = false;
       return;
@@ -575,25 +626,30 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
       }
       const { text } = (await res.json()) as { text: string };
       const cleaned = (text || '').trim();
-      finalizeLockRef.current = false;
+
+      if (session !== sessionRef.current || !activeRef.current) return;
+
       if (!cleaned || cleaned.length < 2) {
         busyRef.current = false;
-        if (activeRef.current) {
-          startRecorder();
-          setPhaseSafe('listening');
-        }
+        finalizeLockRef.current = false;
+        await startRecorder();
+        setPhaseSafe('listening');
         return;
       }
+
+      finalizeLockRef.current = false;
       await runAssistantTurnRef.current(cleaned);
     } catch (err) {
-      finalizeLockRef.current = false;
-      busyRef.current = false;
-      if (controller.signal.aborted || !activeRef.current) return;
+      if (controller.signal.aborted || !activeRef.current || session !== sessionRef.current) {
+        return;
+      }
       setError(err instanceof Error ? err.message : 'Transcription failed');
-      startRecorder();
+      busyRef.current = false;
+      finalizeLockRef.current = false;
+      await startRecorder();
       setPhaseSafe('listening');
     }
-  }, [setPhaseSafe, startRecorder, stopRecorderOnly, stopRecorderToBlob]);
+  }, [setPhaseSafe, startRecorder, stopRecorderAsync]);
 
   finalizeSpeechRef.current = finalizeSpeech;
 
@@ -607,23 +663,25 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     const aiAudible =
       playingRef.current || currentPhase === 'speaking' || currentPhase === 'greeting';
 
-    // Interrupt AI when user starts talking
     if (aiAudible && !busyRef.current) {
       if (loud) {
         if (!bargeStartedAtRef.current) bargeStartedAtRef.current = now;
         if (now - (bargeStartedAtRef.current || now) >= BARGE_IN_MS) {
           abortRef.current?.abort();
           stopPlayback();
-          speakChainRef.current = Promise.resolve();
+          resetSpeakChain();
           busyRef.current = false;
           finalizeLockRef.current = false;
-          stopRecorderOnly();
-          startRecorder();
-          capturingRef.current = true;
-          speechStartedAtRef.current = now;
-          silenceStartedAtRef.current = null;
-          bargeStartedAtRef.current = null;
-          setPhaseSafe('listening');
+          void (async () => {
+            await stopRecorderAsync();
+            if (!activeRef.current) return;
+            await startRecorder();
+            capturingRef.current = true;
+            speechStartedAtRef.current = Date.now();
+            silenceStartedAtRef.current = null;
+            bargeStartedAtRef.current = null;
+            setPhaseSafe('listening');
+          })();
         }
       } else {
         bargeStartedAtRef.current = null;
@@ -634,7 +692,7 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     if (currentPhase !== 'listening' || busyRef.current || finalizeLockRef.current) return;
 
     if (!mediaRecorderRef.current || mediaRecorderRef.current.state === 'inactive') {
-      startRecorder();
+      void startRecorder();
     }
 
     if (loud) {
@@ -652,7 +710,7 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
         void finalizeSpeechRef.current();
       }
     }
-  }, [getRms, setPhaseSafe, startRecorder, stopPlayback, stopRecorderOnly]);
+  }, [getRms, resetSpeakChain, setPhaseSafe, startRecorder, stopPlayback, stopRecorderAsync]);
 
   const startVadLoop = useCallback(() => {
     if (vadTimerRef.current) clearInterval(vadTimerRef.current);
@@ -660,7 +718,18 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
   }, [onVadTick]);
 
   const openMic = useCallback(async () => {
-    if (mediaStreamRef.current) return;
+    // Always refresh mic for a new call — stale stopped tracks break listening
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+      mediaStreamRef.current = null;
+    }
+    try {
+      micSourceRef.current?.disconnect();
+    } catch {
+      /* ignore */
+    }
+    micSourceRef.current = null;
+    analyserRef.current = null;
 
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -672,53 +741,68 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     mediaStreamRef.current = stream;
     mimeTypeRef.current = pickMimeType();
 
-    // Reuse unlocked playback context when possible (avoids iOS autoplay lock)
-    const ctx =
-      playbackCtxRef.current && playbackCtxRef.current.state !== 'closed'
-        ? playbackCtxRef.current
-        : new (window.AudioContext ||
-            (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-    playbackCtxRef.current = ctx;
-    audioCtxRef.current = ctx;
+    const AC = getAudioContextCtor();
+    let ctx = playbackCtxRef.current;
+    if (!ctx || ctx.state === 'closed') {
+      ctx = new AC();
+      playbackCtxRef.current = ctx;
+    }
     if (ctx.state === 'suspended') await ctx.resume();
+
     const source = ctx.createMediaStreamSource(stream);
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 2048;
     analyser.smoothingTimeConstant = 0.3;
     source.connect(analyser);
+    micSourceRef.current = source;
     analyserRef.current = analyser;
   }, []);
 
   const startCall = useCallback(async () => {
-    // Soft reset — keep unlocked playback AudioContext
+    const session = ++sessionRef.current;
+
     activeRef.current = false;
     busyRef.current = false;
     finalizeLockRef.current = false;
     abortRef.current?.abort();
     abortRef.current = null;
-    tearDownMic();
+    await tearDownMic();
     stopPlayback();
     messagesRef.current = [];
-    speakChainRef.current = Promise.resolve();
+    resetSpeakChain();
     mutedRef.current = false;
     setMuted(false);
     setError(null);
 
+    if (session !== sessionRef.current) return;
+
     activeRef.current = true;
+    unlockAudio();
     if (playbackCtxRef.current?.state === 'suspended') {
       await playbackCtxRef.current.resume();
     }
 
     try {
       await openMic();
+      if (session !== sessionRef.current || !activeRef.current) return;
       startVadLoop();
       await runAssistantTurnRef.current();
     } catch (err) {
+      if (session !== sessionRef.current) return;
       const message = err instanceof Error ? err.message : 'Microphone access denied';
       setError(message);
       setPhaseSafe('error');
+      activeRef.current = false;
     }
-  }, [openMic, setPhaseSafe, startVadLoop, stopPlayback, tearDownMic]);
+  }, [
+    openMic,
+    resetSpeakChain,
+    setPhaseSafe,
+    startVadLoop,
+    stopPlayback,
+    tearDownMic,
+    unlockAudio,
+  ]);
 
   const toggleMute = useCallback(() => {
     const next = !mutedRef.current;
@@ -728,17 +812,22 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
       t.enabled = !next;
     });
     if (next) {
-      stopRecorderOnly();
+      void stopRecorderAsync();
     } else if (activeRef.current && !busyRef.current && phaseRef.current === 'listening') {
-      startRecorder();
+      void startRecorder();
     }
-  }, [startRecorder, stopRecorderOnly]);
+  }, [startRecorder, stopRecorderAsync]);
 
   useEffect(() => {
     return () => {
+      sessionRef.current += 1;
       activeRef.current = false;
-      tearDownMic();
+      void tearDownMic();
       stopPlayback();
+      if (playbackCtxRef.current && playbackCtxRef.current.state !== 'closed') {
+        void playbackCtxRef.current.close().catch(() => undefined);
+        playbackCtxRef.current = null;
+      }
     };
   }, [stopPlayback, tearDownMic]);
 
