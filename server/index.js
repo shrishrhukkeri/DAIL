@@ -138,8 +138,8 @@ app.post('/api/chat', requireGroq, async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders?.();
 
-  // Do NOT use req.destroyed / req.on('close') — after express.json() reads the body,
-  // Node marks the request closed/destroyed even while the SSE response is still live.
+  // Do NOT listen for request-stream close after express.json() reads the body —
+  // Node marks that request finished even while the SSE response is still live.
   let clientGone = false;
   res.on('close', () => {
     clientGone = true;
@@ -242,6 +242,11 @@ app.post('/api/speak', requireGroq, async (req, res) => {
     return res.status(400).json({ error: 'text is empty after cleanup' });
   }
 
+  // Client locks one engine per call — honor preferEngine so voice doesn't flip mid-conversation
+  const preferRaw = req.body?.preferEngine;
+  const preferEngine =
+    preferRaw === 'fallback' || preferRaw === 'orpheus' ? preferRaw : 'auto';
+
   const sendAudio = (buffer, contentType, via) => {
     res.setHeader('Content-Type', contentType);
     res.setHeader('Content-Length', buffer.length);
@@ -249,6 +254,16 @@ app.post('/api/speak', requireGroq, async (req, res) => {
     res.setHeader('X-TTS-Engine', via);
     res.send(buffer);
   };
+
+  if (preferEngine === 'fallback') {
+    try {
+      const mpeg = await fallbackMpegTts(cleaned);
+      return sendAudio(mpeg, 'audio/mpeg', 'fallback');
+    } catch (fbErr) {
+      console.error('forced fallback TTS error:', fbErr);
+      return res.status(500).json({ error: fbErr.message || 'Fallback TTS failed', code: 'fallback_failed' });
+    }
+  }
 
   try {
     const chunks = chunkSpeakText(cleaned, ORPHEUS_CHUNK);
@@ -266,6 +281,14 @@ app.post('/api/speak', requireGroq, async (req, res) => {
         if (buffer.length) wavs.push(buffer);
       } catch (chunkErr) {
         if (isRateLimited(chunkErr)) {
+          // Locked to Orpheus for this call — fail hard so client stays on one voice
+          if (preferEngine === 'orpheus') {
+            console.warn('Orpheus rate-limited — preferEngine=orpheus, not falling back');
+            return res.status(503).json({
+              error: 'Orpheus rate-limited',
+              code: 'orpheus_rate_limited',
+            });
+          }
           console.warn('Orpheus rate-limited — using fallback TTS for full text');
           // Never return a partial Orpheus concat mid-sentence; synthesize the whole reply
           const mpeg = await fallbackMpegTts(cleaned);
@@ -276,6 +299,9 @@ app.post('/api/speak', requireGroq, async (req, res) => {
     }
 
     if (!wavs.length) {
+      if (preferEngine === 'orpheus') {
+        return res.status(503).json({ error: 'Orpheus returned empty audio', code: 'orpheus_empty' });
+      }
       const mpeg = await fallbackMpegTts(cleaned);
       return sendAudio(mpeg, 'audio/mpeg', 'fallback');
     }
@@ -283,6 +309,11 @@ app.post('/api/speak', requireGroq, async (req, res) => {
     return sendAudio(concatWavBuffers(wavs), 'audio/wav', 'orpheus');
   } catch (err) {
     console.error('speak error:', err);
+    if (preferEngine === 'orpheus') {
+      const message = err?.message || 'TTS failed';
+      const code = err?.error?.error?.code || err?.code || 'tts_failed';
+      return res.status(503).json({ error: message, code });
+    }
     try {
       const mpeg = await fallbackMpegTts(cleaned);
       console.warn('Orpheus failed — served fallback TTS');

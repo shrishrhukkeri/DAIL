@@ -187,8 +187,11 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
   const finalizeLockRef = useRef(false);
   /** Monotonic session id — ignores stale async work from a previous call/turn. */
   const sessionRef = useRef(0);
-  /** Stick to one TTS engine per call so the voice doesn't flip mid-conversation. */
-  const ttsModeRef = useRef<'unset' | 'groq' | 'browser'>('unset');
+  /**
+   * One voice per call. Orpheus WAV and Google MPEG fallback sound different —
+   * never mix them (or browser speech) after the first successful utterance.
+   */
+  const ttsEngineRef = useRef<'unset' | 'orpheus' | 'fallback' | 'browser'>('unset');
   const browserVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const noiseFloorRef = useRef(0.005);
   const listenArmedAtRef = useRef(0);
@@ -458,7 +461,8 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
       void playbackCtxRef.current.suspend().catch(() => undefined);
     }
     messagesRef.current = [];
-    ttsModeRef.current = 'unset';
+    ttsEngineRef.current = 'unset';
+    browserVoiceRef.current = null;
     mutedRef.current = false;
     setMuted(false);
     setPhaseSafe('idle');
@@ -749,6 +753,9 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
 
   const fetchGroqSpeech = useCallback(async (text: string, signal: AbortSignal) => {
     let lastErr: unknown;
+    const locked = ttsEngineRef.current;
+    const preferEngine =
+      locked === 'fallback' ? 'fallback' : locked === 'orpheus' ? 'orpheus' : undefined;
     // Production Cloudflare sometimes resets /api/speak — retry a few times
     for (let attempt = 0; attempt < 3; attempt++) {
       if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -756,10 +763,16 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
         const res = await fetch('/api/speak', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: text.slice(0, 2000) }),
+          body: JSON.stringify({
+            text: text.slice(0, 2000),
+            ...(preferEngine ? { preferEngine } : {}),
+          }),
           signal,
         });
-        if (res.ok || res.status < 500) return res;
+        // 503 orpheus_rate_limited is intentional when locked — do not retry into a voice flip
+        if (res.ok || res.status < 500 || (preferEngine === 'orpheus' && res.status === 503)) {
+          return res;
+        }
         lastErr = new Error(`TTS HTTP ${res.status}`);
       } catch (err) {
         lastErr = err;
@@ -771,77 +784,110 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     throw new Error('TTS fetch failed');
   }, []);
 
+  const lockTtsEngine = useCallback((engine: 'orpheus' | 'fallback' | 'browser') => {
+    if (ttsEngineRef.current === 'unset') {
+      ttsEngineRef.current = engine;
+    }
+  }, []);
+
   /**
-   * Prefer Groq TTS; on any fetch/play failure always fall back to browser speech
-   * so the turn is never silent.
+   * One voice per call. First successful utterance locks the engine for the rest
+   * of the call (new calls may pick a different engine).
    */
   const speakFullReply = useCallback(
     async (text: string, signal: AbortSignal, session: number) => {
       const trimmed = text.replace(/\[[^\]]+\]/g, ' ').replace(/\s+/g, ' ').trim();
       if (!trimmed || signal.aborted || session !== sessionRef.current) return;
 
-      let playedOk = false;
+      const speakBrowserLocked = async () => {
+        if (window.speechSynthesis && !window.speechSynthesis.getVoices().length) {
+          await new Promise<void>((r) => {
+            const done = () => {
+              window.speechSynthesis.removeEventListener('voiceschanged', done);
+              r();
+            };
+            window.speechSynthesis.addEventListener('voiceschanged', done);
+            setTimeout(done, 300);
+          });
+        }
+        pickBrowserVoice();
+        await speakWithBrowser(trimmed, signal, session);
+        ttsEngineRef.current = 'browser';
+      };
 
-      if (ttsModeRef.current !== 'browser') {
-        for (let attempt = 0; attempt < 2; attempt++) {
-          if (signal.aborted || session !== sessionRef.current) return;
-          try {
-            if (attempt > 0) {
-              await new Promise((r) => setTimeout(r, 400));
-            }
-            const res = await fetchGroqSpeech(trimmed, signal);
-            if (res.ok) {
-              const blob = await res.blob();
-              if (!blob.size) {
-                console.warn('TTS returned empty audio');
-                if (attempt === 0) continue;
-                break;
-              }
-              try {
-                await playGroqWav(blob, signal, session);
-                ttsModeRef.current = 'groq';
-                playedOk = true;
-                return;
-              } catch (playErr) {
-                if (signal.aborted || (playErr instanceof Error && playErr.message === 'aborted')) {
-                  return;
-                }
-                console.warn('TTS audio play failed:', playErr);
-                setError('Audio playback failed — using device voice');
-                if (attempt === 0) continue;
-                break;
-              }
-            }
-            const errBody = await res.json().catch(() => ({}));
-            console.warn('TTS failed:', errBody.error || res.status);
-            if (attempt === 0 && res.status >= 500) continue;
-            break;
-          } catch (err) {
-            if (signal.aborted) return;
-            console.warn('Groq TTS error:', err);
-            if (attempt === 0) continue;
-            break;
+      if (ttsEngineRef.current === 'browser') {
+        try {
+          await speakBrowserLocked();
+        } catch (err) {
+          if (signal.aborted) return;
+          const message = err instanceof Error ? err.message : 'Voice playback failed';
+          setError(message);
+          onFatalError?.(message);
+        }
+        return;
+      }
+
+      let playedOk = false;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (signal.aborted || session !== sessionRef.current) return;
+        try {
+          if (attempt > 0) {
+            await new Promise((r) => setTimeout(r, 400));
           }
+          const res = await fetchGroqSpeech(trimmed, signal);
+          if (res.ok) {
+            const engineHeader = (res.headers.get('X-TTS-Engine') || 'orpheus').toLowerCase();
+            const engine: 'orpheus' | 'fallback' =
+              engineHeader === 'fallback' ? 'fallback' : 'orpheus';
+
+            // Already locked to a different server engine — reject and retry / fall through
+            if (ttsEngineRef.current === 'orpheus' && engine === 'fallback') {
+              continue;
+            }
+            if (ttsEngineRef.current === 'fallback' && engine === 'orpheus') {
+              continue;
+            }
+
+            const blob = await res.blob();
+            if (!blob.size) {
+              console.warn('TTS returned empty audio');
+              if (attempt === 0) continue;
+              break;
+            }
+            try {
+              await playGroqWav(blob, signal, session);
+              lockTtsEngine(engine);
+              playedOk = true;
+              return;
+            } catch (playErr) {
+              if (signal.aborted || (playErr instanceof Error && playErr.message === 'aborted')) {
+                return;
+              }
+              console.warn('TTS audio play failed:', playErr);
+              if (attempt === 0) continue;
+              break;
+            }
+          }
+          const errBody = await res.json().catch(() => ({}));
+          console.warn('TTS failed:', errBody.error || res.status);
+          // Locked Orpheus exhausted — do not flip to Google mid-call; use browser once
+          if (ttsEngineRef.current === 'orpheus') break;
+          if (attempt === 0 && res.status >= 500) continue;
+          break;
+        } catch (err) {
+          if (signal.aborted) return;
+          console.warn('Groq TTS error:', err);
+          if (attempt === 0) continue;
+          break;
         }
       }
 
       if (playedOk || signal.aborted || session !== sessionRef.current) return;
 
-      // Always audible fallback when Groq fetch/play fails (including mid-call)
-      if (window.speechSynthesis && !window.speechSynthesis.getVoices().length) {
-        await new Promise<void>((r) => {
-          const done = () => {
-            window.speechSynthesis.removeEventListener('voiceschanged', done);
-            r();
-          };
-          window.speechSynthesis.addEventListener('voiceschanged', done);
-          setTimeout(done, 300);
-        });
-      }
-      pickBrowserVoice();
+      // Last resort: lock browser voice for the rest of this call (no more flips)
       try {
-        await speakWithBrowser(trimmed, signal, session);
-        if (ttsModeRef.current === 'unset') ttsModeRef.current = 'browser';
+        setError('Using device voice for the rest of this call');
+        await speakBrowserLocked();
       } catch (err) {
         if (signal.aborted) return;
         const message = err instanceof Error ? err.message : 'Voice playback failed';
@@ -849,7 +895,7 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
         onFatalError?.(message);
       }
     },
-    [fetchGroqSpeech, onFatalError, pickBrowserVoice, playGroqWav, speakWithBrowser],
+    [fetchGroqSpeech, lockTtsEngine, onFatalError, pickBrowserVoice, playGroqWav, speakWithBrowser],
   );
 
   const waitForPlaybackIdle = useCallback(
@@ -944,33 +990,14 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
           }
         }
 
-        // Keep busy=true through TTS
+        // Keep busy=true through TTS — always go through speakFullReply so voice lock holds
         if (earlySpeakPromise) {
           const rest =
             (remainder + streamBuf).trim() ||
             (full ? full.slice(earlySpoken.length).trim() : '');
-          // Prefetch rest audio while sentence 1 is still playing (cuts mid-reply silence)
-          const restPrefetch =
-            rest && !controller.signal.aborted
-              ? fetchGroqSpeech(rest, controller.signal)
-                  .then(async (res) => (res.ok ? res.blob() : null))
-                  .catch(() => null)
-              : Promise.resolve(null);
-
           await earlySpeakPromise;
-
           if (rest && session === sessionRef.current && activeRef.current && !controller.signal.aborted) {
-            const prefBlob = await restPrefetch;
-            if (prefBlob?.size) {
-              try {
-                await playGroqWav(prefBlob, controller.signal, session);
-                ttsModeRef.current = 'groq';
-              } catch {
-                await speakFullReply(rest, controller.signal, session);
-              }
-            } else {
-              await speakFullReply(rest, controller.signal, session);
-            }
+            await speakFullReply(rest, controller.signal, session);
           }
         } else if (full) {
           setPhaseSafe(userText ? 'speaking' : 'greeting');
@@ -1007,8 +1034,6 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
       }
     },
     [
-      fetchGroqSpeech,
-      playGroqWav,
       setMicCapture,
       setPhaseSafe,
       speakFullReply,
@@ -1273,7 +1298,8 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     // Preserve Safari HTMLAudio unlock — do not tear down the silent keep-alive loop
     stopPlayback({ preserveUnlock: true });
     messagesRef.current = [];
-    ttsModeRef.current = 'unset';
+    ttsEngineRef.current = 'unset';
+    browserVoiceRef.current = null;
     mutedRef.current = false;
     setMuted(false);
     setError(null);
