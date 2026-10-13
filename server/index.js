@@ -14,15 +14,17 @@ const rootDir = path.resolve(__dirname, '..');
 const PORT = process.env.PORT || 3001;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
-// llama-3.1-8b-instant is deprecated for free/developer tiers (shutdown Aug 2026)
-const CHAT_MODEL = process.env.GROQ_CHAT_MODEL || 'qwen/qwen3.8-27b';
+// llama-3.1-8b-instant is enterprise-only now; gpt-oss-20b is Groq's recommended 8B-class replacement
+const CHAT_MODEL = process.env.GROQ_CHAT_MODEL || 'openai/gpt-oss-20b';
 const STT_MODEL = process.env.GROQ_STT_MODEL || 'whisper-large-v3-turbo';
 const TTS_MODEL = process.env.GROQ_TTS_MODEL || 'canopylabs/orpheus-v1-english';
 const TTS_VOICE = process.env.GROQ_TTS_VOICE || 'austin';
+const CHAT_MAX_TOKENS = Number(process.env.GROQ_CHAT_MAX_TOKENS || 120);
+const CHAT_HISTORY_LIMIT = Number(process.env.GROQ_CHAT_HISTORY_LIMIT || 8);
 
 const SYSTEM_PROMPT =
   process.env.GROQ_SYSTEM_PROMPT ||
-  'You are a friendly phone assistant. Keep replies short and conversational—1 to 3 sentences—so they sound natural when spoken aloud. Avoid markdown, lists, and URLs.';
+  'You are a friendly phone assistant. Reply in 1 short spoken sentence when possible (max 2). No markdown, lists, or URLs.';
 
 const app = express();
 const upload = multer({
@@ -85,9 +87,16 @@ app.post('/api/chat', requireGroq, async (req, res) => {
     return res.status(400).json({ error: 'messages array is required' });
   }
 
-  const safeMessages = messages
+  let safeMessages = messages
     .filter((m) => m && typeof m.content === 'string' && (m.role === 'user' || m.role === 'assistant' || m.role === 'system'))
     .map((m) => ({ role: m.role, content: m.content }));
+
+  // Keep only recent turns to limit token burn
+  const systemMsgs = safeMessages.filter((m) => m.role === 'system');
+  const turnMsgs = safeMessages.filter((m) => m.role !== 'system').slice(-CHAT_HISTORY_LIMIT);
+  safeMessages = systemMsgs.length
+    ? [...systemMsgs.slice(0, 1), ...turnMsgs]
+    : [{ role: 'system', content: SYSTEM_PROMPT }, ...turnMsgs];
 
   if (!safeMessages.some((m) => m.role === 'system')) {
     safeMessages.unshift({ role: 'system', content: SYSTEM_PROMPT });
@@ -99,13 +108,19 @@ app.post('/api/chat', requireGroq, async (req, res) => {
   res.flushHeaders?.();
 
   try {
-    const stream = await req.groq.chat.completions.create({
+    const chatParams = {
       model: CHAT_MODEL,
       messages: safeMessages,
       stream: true,
-      temperature: 0.7,
-      max_tokens: 300,
-    });
+      temperature: 0.6,
+      max_tokens: CHAT_MAX_TOKENS,
+    };
+    // gpt-oss models support low reasoning to avoid burning tokens on hidden chain-of-thought
+    if (CHAT_MODEL.includes('gpt-oss')) {
+      chatParams.reasoning_effort = 'low';
+    }
+
+    const stream = await req.groq.chat.completions.create(chatParams);
 
     for await (const chunk of stream) {
       if (req.aborted) break;

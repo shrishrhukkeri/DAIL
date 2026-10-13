@@ -13,7 +13,11 @@ services:
       - key: GROQ_API_KEY
         sync: false
       - key: GROQ_CHAT_MODEL
-        value: qwen/qwen3.8-27b
+        value: openai/gpt-oss-20b
+      - key: GROQ_CHAT_MAX_TOKENS
+        value: "120"
+      - key: GROQ_CHAT_HISTORY_LIMIT
+        value: "8"
       - key: GROQ_STT_MODEL
         value: whisper-large-v3-turbo
       - key: GROQ_TTS_MODEL

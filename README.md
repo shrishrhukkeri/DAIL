@@ -3,7 +3,7 @@
 Phone-style UI. Dial **1400** to start a two-way call powered by Groq:
 
 1. **Whisper** (`whisper-large-v3-turbo`) — speech to text  
-2. **LLM** (`qwen/qwen3.8-27b`) — reply text (streamed)  
+2. **LLM** (`openai/gpt-oss-20b`) — reply text (streamed; Llama 3.1 8B replacement on Groq)  
 3. **Orpheus TTS** (`canopylabs/orpheus-v1-english`) — spoken audio (falls back to browser TTS if Orpheus terms are not accepted yet)  
 
 **One-time Groq step:** open [Orpheus in the Groq Playground](https://console.groq.com/playground?model=canopylabs%2Forpheus-v1-english) and accept the model terms so API TTS works.
