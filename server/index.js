@@ -138,6 +138,13 @@ app.post('/api/chat', requireGroq, async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders?.();
 
+  // Do NOT use req.destroyed / req.on('close') — after express.json() reads the body,
+  // Node marks the request closed/destroyed even while the SSE response is still live.
+  let clientGone = false;
+  res.on('close', () => {
+    clientGone = true;
+  });
+
   try {
     const chatParams = {
       model: CHAT_MODEL,
@@ -154,8 +161,7 @@ app.post('/api/chat', requireGroq, async (req, res) => {
     const stream = await req.groq.chat.completions.create(chatParams);
 
     for await (const chunk of stream) {
-      // Node 20+: req.aborted is deprecated; also watch response close
-      if (req.destroyed || res.writableEnded || res.closed) break;
+      if (clientGone || res.writableEnded || !res.writable) break;
       const token = chunk.choices?.[0]?.delta?.content;
       if (token) {
         res.write(`data: ${JSON.stringify({ token })}\n\n`);
