@@ -86,6 +86,7 @@ function App() {
       if (token !== dialTokenRef.current) return;
 
       if (numberRef.current === AI_NUMBER) {
+        stopAllAudio();
         setCallStatus('connected');
         void startCall();
       } else {

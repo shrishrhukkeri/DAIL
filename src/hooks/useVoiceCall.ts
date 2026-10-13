@@ -245,7 +245,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
       /* ignore */
     }
 
-    // Also unlock HTMLMediaElement playback (Safari)
+    // Unlock HTMLMediaElement + speechSynthesis during the dial gesture (Safari)
     try {
       const warm = new Audio(
         'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=',
@@ -254,6 +254,17 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
       void warm.play().then(() => warm.pause()).catch(() => undefined);
     } catch {
       /* ignore */
+    }
+    if (typeof window !== 'undefined' && window.speechSynthesis) {
+      try {
+        window.speechSynthesis.cancel();
+        const warmUtter = new SpeechSynthesisUtterance(' ');
+        warmUtter.volume = 0;
+        window.speechSynthesis.speak(warmUtter);
+        window.speechSynthesis.cancel();
+      } catch {
+        /* ignore */
+      }
     }
   }, [stopKeepAlive]);
 
@@ -507,10 +518,16 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
       if (!blob.size) throw new Error('Empty TTS audio');
 
       stopHtmlAudio();
+      // Disable mic while AI talks — stops echo barge-in from killing playback
+      mediaStreamRef.current?.getAudioTracks().forEach((t) => {
+        t.enabled = false;
+      });
+
       const url = URL.createObjectURL(blob);
       htmlAudioUrlRef.current = url;
       const audio = new Audio();
       audio.preload = 'auto';
+      audio.volume = 1;
       audio.src = url;
       audio.setAttribute('playsinline', 'true');
       audio.setAttribute('webkit-playsinline', 'true');
@@ -524,6 +541,11 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
           signal.removeEventListener('abort', onAbort);
           playingRef.current = false;
           stopHtmlAudio();
+          if (!mutedRef.current) {
+            mediaStreamRef.current?.getAudioTracks().forEach((t) => {
+              t.enabled = true;
+            });
+          }
           if (err) reject(err);
           else resolve();
         };
@@ -612,7 +634,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
           if (signal.aborted || session !== sessionRef.current) return;
           try {
             if (attempt > 0) {
-              await new Promise((r) => setTimeout(r, 800));
+              await new Promise((r) => setTimeout(r, 400));
             }
             const res = await fetchGroqSpeech(trimmed, signal);
             lastStatus = res.status;
@@ -626,16 +648,15 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
                 if (signal.aborted || (playErr instanceof Error && playErr.message === 'aborted')) {
                   return;
                 }
-                console.warn('Groq audio play failed:', playErr);
-                // Do not lock groq mode until playback actually worked
+                console.warn('TTS audio play failed:', playErr);
                 if (attempt === 0) continue;
                 break;
               }
             }
             const errBody = await res.json().catch(() => ({}));
-            console.warn('Groq TTS failed:', errBody.error || res.status);
-            // Retry once on rate limit / transient 5xx
-            if (attempt === 0 && (res.status === 429 || res.status >= 500)) continue;
+            console.warn('TTS failed:', errBody.error || res.status);
+            // 429: skip long retry — server should already serve fallback audio
+            if (attempt === 0 && res.status >= 500) continue;
             break;
           } catch (err) {
             if (signal.aborted) return;

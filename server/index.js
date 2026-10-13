@@ -143,49 +143,156 @@ app.post('/api/chat', requireGroq, async (req, res) => {
   }
 });
 
+/** Orpheus hard-caps input at 200 chars; keep under to save daily token quota. */
+const ORPHEUS_CHUNK = 180;
+
+function cleanSpeakText(text) {
+  return text.replace(/\[[^\]]+\]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 1200);
+}
+
+function chunkSpeakText(text, maxLen) {
+  if (text.length <= maxLen) return [text];
+  const chunks = [];
+  let rest = text;
+  while (rest.length > maxLen) {
+    let cut = rest.lastIndexOf(' ', maxLen);
+    if (cut < maxLen * 0.4) cut = maxLen;
+    chunks.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trim();
+  }
+  if (rest) chunks.push(rest);
+  return chunks.filter(Boolean);
+}
+
+function concatWavBuffers(parts) {
+  if (parts.length === 1) return parts[0];
+  const pcmParts = [];
+  let totalPcm = 0;
+  let header = null;
+  for (const buf of parts) {
+    const dataIdx = buf.indexOf(Buffer.from('data'));
+    if (dataIdx < 0) continue;
+    const dataSize = buf.readUInt32LE(dataIdx + 4);
+    const pcm = buf.subarray(dataIdx + 8, dataIdx + 8 + dataSize);
+    if (!header) header = Buffer.from(buf.subarray(0, dataIdx));
+    pcmParts.push(pcm);
+    totalPcm += pcm.length;
+  }
+  if (!header || !pcmParts.length) return parts[0];
+  const out = Buffer.alloc(header.length + 8 + totalPcm);
+  header.copy(out, 0);
+  out.writeUInt32LE(out.length - 8, 4);
+  out.write('data', header.length);
+  out.writeUInt32LE(totalPcm, header.length + 4);
+  let offset = header.length + 8;
+  for (const p of pcmParts) {
+    p.copy(out, offset);
+    offset += p.length;
+  }
+  return out;
+}
+
+function isRateLimited(err) {
+  const message = err?.message || '';
+  const code = err?.error?.error?.code || err?.code || '';
+  const statusNum = err?.status || err?.statusCode || err?.error?.status;
+  return statusNum === 429 || code === 'rate_limit_exceeded' || /rate.?limit/i.test(message);
+}
+
+/** Keyless MPEG fallback so calls still have voice when Orpheus TPD is exhausted. */
+async function fallbackMpegTts(text) {
+  const chunks = chunkSpeakText(text, 180);
+  const buffers = [];
+  for (const chunk of chunks) {
+    const url = `https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=en&q=${encodeURIComponent(chunk)}`;
+    const r = await fetch(url, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+        Accept: '*/*',
+        Referer: 'https://translate.google.com/',
+      },
+    });
+    if (!r.ok) {
+      throw new Error(`Fallback TTS failed (${r.status})`);
+    }
+    buffers.push(Buffer.from(await r.arrayBuffer()));
+  }
+  return Buffer.concat(buffers);
+}
+
 app.post('/api/speak', requireGroq, async (req, res) => {
   const text = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
   if (!text) {
     return res.status(400).json({ error: 'text is required' });
   }
 
-  try {
-    // Always the same Orpheus persona — strip LLM vocal-direction tags for steadier delivery
-    const cleaned = text.replace(/\[[^\]]+\]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 2000);
-    if (!cleaned) {
-      return res.status(400).json({ error: 'text is empty after cleanup' });
-    }
+  const cleaned = cleanSpeakText(text);
+  if (!cleaned) {
+    return res.status(400).json({ error: 'text is empty after cleanup' });
+  }
 
-    const response = await req.groq.audio.speech.create({
-      model: TTS_MODEL,
-      voice: TTS_VOICE,
-      input: cleaned,
-      response_format: 'wav',
-    });
-
-    const buffer = Buffer.from(await response.arrayBuffer());
-    if (!buffer.length) {
-      return res.status(502).json({ error: 'Empty TTS audio from provider', code: 'empty_audio' });
-    }
-    res.setHeader('Content-Type', 'audio/wav');
+  const sendAudio = (buffer, contentType, via) => {
+    res.setHeader('Content-Type', contentType);
     res.setHeader('Content-Length', buffer.length);
     res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-TTS-Engine', via);
     res.send(buffer);
+  };
+
+  try {
+    const chunks = chunkSpeakText(cleaned, ORPHEUS_CHUNK);
+    const wavs = [];
+
+    for (const chunk of chunks) {
+      try {
+        const response = await req.groq.audio.speech.create({
+          model: TTS_MODEL,
+          voice: TTS_VOICE,
+          input: chunk,
+          response_format: 'wav',
+        });
+        const buffer = Buffer.from(await response.arrayBuffer());
+        if (buffer.length) wavs.push(buffer);
+      } catch (chunkErr) {
+        if (isRateLimited(chunkErr)) {
+          console.warn('Orpheus rate-limited — using fallback TTS');
+          if (wavs.length) break;
+          const mpeg = await fallbackMpegTts(cleaned);
+          return sendAudio(mpeg, 'audio/mpeg', 'fallback');
+        }
+        throw chunkErr;
+      }
+    }
+
+    if (!wavs.length) {
+      const mpeg = await fallbackMpegTts(cleaned);
+      return sendAudio(mpeg, 'audio/mpeg', 'fallback');
+    }
+
+    return sendAudio(concatWavBuffers(wavs), 'audio/wav', 'orpheus');
   } catch (err) {
     console.error('speak error:', err);
-    const message = err?.message || 'TTS failed';
-    const code = err?.error?.error?.code || err?.code || 'tts_failed';
-    const statusNum = err?.status || err?.statusCode || err?.error?.status;
-    let status = 500;
-    if (message.includes('terms acceptance') || code === 'model_terms_required') status = 403;
-    else if (statusNum === 429 || /rate.?limit/i.test(message)) status = 429;
-    else if (statusNum >= 400 && statusNum < 600) status = statusNum;
-    res.status(status).json({
-      error: message,
-      code: status === 403 ? 'model_terms_required' : code,
-      acceptTermsUrl:
-        'https://console.groq.com/playground?model=canopylabs%2Forpheus-v1-english',
-    });
+    try {
+      const mpeg = await fallbackMpegTts(cleaned);
+      console.warn('Orpheus failed — served fallback TTS');
+      return sendAudio(mpeg, 'audio/mpeg', 'fallback');
+    } catch (fbErr) {
+      console.error('fallback TTS error:', fbErr);
+      const message = err?.message || 'TTS failed';
+      const code = err?.error?.error?.code || err?.code || 'tts_failed';
+      const statusNum = err?.status || err?.statusCode || err?.error?.status;
+      let status = 500;
+      if (message.includes('terms acceptance') || code === 'model_terms_required') status = 403;
+      else if (isRateLimited(err)) status = 429;
+      else if (statusNum >= 400 && statusNum < 600) status = statusNum;
+      res.status(status).json({
+        error: message,
+        code: status === 403 ? 'model_terms_required' : code,
+        acceptTermsUrl:
+          'https://console.groq.com/playground?model=canopylabs%2Forpheus-v1-english',
+      });
+    }
   }
 });
 
