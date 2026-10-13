@@ -74,7 +74,27 @@ function looksLikeMediaContainer(buf: ArrayBuffer): boolean {
   if (u8[4] === 0x66 && u8[5] === 0x74 && u8[6] === 0x79 && u8[7] === 0x70) return true;
   // Ogg
   if (u8[0] === 0x4f && u8[1] === 0x67 && u8[2] === 0x67 && u8[3] === 0x53) return true;
+  // Raw ADTS AAC (sync word 0xFFF1 / 0xFFF9 …)
+  if (u8[0] === 0xff && (u8[1] & 0xf0) === 0xf0) return true;
   return false;
+}
+
+/** Split on sentence end; skip common abbreviations so early TTS is not stuck on "Dr." */
+function takeEarlySentence(buf: string, minChars: number): { sentence: string; rest: string } | null {
+  const re = /[.!?](?=\s|$)/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(buf)) !== null) {
+    const end = match.index + 1;
+    const sentence = buf.slice(0, end).trim();
+    if (sentence.length < minChars) continue;
+    // Reject abbreviation-like endings: single capital letter before the period (Dr./Mr./Ms./St.)
+    if (/[A-Z]\.$/.test(sentence) && sentence.length < minChars + 8) continue;
+    // Also skip e.g. / i.e. style
+    if (/\b(e\.g|i\.e|vs|etc)\.$/i.test(sentence) && !/[!?]/.test(sentence)) continue;
+    const rest = buf.slice(end).replace(/^\s+/, '');
+    return { sentence, rest };
+  }
+  return null;
 }
 
 async function streamChat(
@@ -299,32 +319,17 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     const ctx = playbackCtxRef.current;
     void ctx.resume();
 
-    // Inaudible keep-alive so iOS does not suspend the context before greeting TTS
+    // Keep looping silent media on the SAME element used for TTS (Safari unlock retention).
+    // No 20Hz oscillator — it locks mobile audio routing and leaves the tab "playing" forever.
     stopKeepAlive();
-    try {
-      const gain = ctx.createGain();
-      gain.gain.value = 0.0001;
-      const osc = ctx.createOscillator();
-      osc.frequency.value = 20;
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(0);
-      keepAliveOscRef.current = osc;
-      keepAliveGainRef.current = gain;
-    } catch {
-      /* ignore */
-    }
-
-    // Keep looping silent media on the SAME element used for TTS (do not pause — Safari drops unlock)
     startSilentKeepAlive();
 
+    // Warm speechSynthesis without cancel-after-speak (corrupts WebKit TTS queue)
     if (typeof window !== 'undefined' && window.speechSynthesis) {
       try {
-        window.speechSynthesis.cancel();
-        const warmUtter = new SpeechSynthesisUtterance(' ');
+        const warmUtter = new SpeechSynthesisUtterance('');
         warmUtter.volume = 0;
         window.speechSynthesis.speak(warmUtter);
-        window.speechSynthesis.cancel();
       } catch {
         /* ignore */
       }
@@ -611,20 +616,34 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
       if (signal.aborted || session !== sessionRef.current) {
         throw new Error('aborted');
       }
+      // Push first, then call playNext WHILE playingRef is still false.
+      // playNext itself sets playingRef=true; setting it earlier deadlocks
+      // (playNext early-returns and the wait loop never resolves).
       audioQueueRef.current.push(audioBuf);
-      playingRef.current = true;
       setMicCapture(false);
       setPhaseSafe('speaking');
       playNextRef.current();
+      const startedAt = Date.now();
       await new Promise<void>((resolve, reject) => {
         const wait = () => {
           if (signal.aborted || session !== sessionRef.current) {
             reject(new Error('aborted'));
             return;
           }
+          // Safety: never hang forever if playNext failed to start
+          if (Date.now() - startedAt > 15000) {
+            playingRef.current = false;
+            audioQueueRef.current = [];
+            reject(new Error('Web Audio playback timeout'));
+            return;
+          }
           if (!playingRef.current && audioQueueRef.current.length === 0) {
             resolve();
             return;
+          }
+          // If queue still has audio but nothing is playing, kick playNext again
+          if (!playingRef.current && audioQueueRef.current.length > 0) {
+            playNextRef.current();
           }
           setTimeout(wait, 40);
         };
@@ -634,15 +653,13 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     [setMicCapture, setPhaseSafe],
   );
 
-  /** Persistent HTMLAudio + Web Audio; Safari prefers Web Audio (gesture-unlocked context). */
+  /** Prefer unlocked HTMLAudio (silent keep-alive); Web Audio as fallback. */
   const playGroqWav = useCallback(
     async (blob: Blob, signal: AbortSignal, session: number) => {
       if (signal.aborted || !activeRef.current || session !== sessionRef.current) {
         throw new Error('aborted');
       }
       if (!blob.size) throw new Error('Empty TTS audio');
-
-      const preferWebAudio = isSafariBrowser();
 
       const tryHtml = () =>
         new Promise<void>((resolve, reject) => {
@@ -717,24 +734,12 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
           }
         });
 
-      if (preferWebAudio) {
-        try {
-          await playViaWebAudio(blob, signal, session);
-          startSilentKeepAlive();
-          return;
-        } catch (err) {
-          if (signal.aborted || (err instanceof Error && err.message === 'aborted')) throw err;
-          console.warn('Safari Web Audio play failed, trying HTMLAudio', err);
-          await tryHtml();
-          return;
-        }
-      }
-
+      // HTMLAudio first (same element primed in dial gesture) — works on Safari + Chrome
       try {
         await tryHtml();
       } catch (err) {
         if (signal.aborted || (err instanceof Error && err.message === 'aborted')) throw err;
-        console.warn('HTMLAudio play blocked, trying Web Audio', err);
+        console.warn('HTMLAudio play failed, trying Web Audio', err);
         await playViaWebAudio(blob, signal, session);
         startSilentKeepAlive();
       }
@@ -743,13 +748,27 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
   );
 
   const fetchGroqSpeech = useCallback(async (text: string, signal: AbortSignal) => {
-    const res = await fetch('/api/speak', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: text.slice(0, 2000) }),
-      signal,
-    });
-    return res;
+    let lastErr: unknown;
+    // Production Cloudflare sometimes resets /api/speak — retry a few times
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      try {
+        const res = await fetch('/api/speak', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: text.slice(0, 2000) }),
+          signal,
+        });
+        if (res.ok || res.status < 500) return res;
+        lastErr = new Error(`TTS HTTP ${res.status}`);
+      } catch (err) {
+        lastErr = err;
+        if (signal.aborted) throw err;
+      }
+      await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+    }
+    if (lastErr) throw lastErr;
+    throw new Error('TTS fetch failed');
   }, []);
 
   /**
@@ -886,7 +905,7 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
       setError(null);
 
       try {
-        // Pipeline: speak first sentence as soon as it arrives; remainder after stream ends
+        // Pipeline: speak first sentence ASAP; prefetch remaining TTS while it plays
         let earlySpoken = '';
         let remainder = '';
         let earlySpeakPromise: Promise<void> | null = null;
@@ -901,10 +920,10 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
               return;
             }
             streamBuf += token;
-            const match = streamBuf.match(/^([\s\S]+?[.!?])(\s+|$)/);
-            if (match && match[1].trim().length >= EARLY_TTS_MIN_CHARS) {
-              earlySpoken = match[1].trim();
-              remainder = streamBuf.slice(match[0].length);
+            const early = takeEarlySentence(streamBuf, EARLY_TTS_MIN_CHARS);
+            if (early) {
+              earlySpoken = early.sentence;
+              remainder = early.rest;
               streamBuf = '';
               setPhaseSafe(userText ? 'speaking' : 'greeting');
               earlySpeakPromise = speakFullReply(earlySpoken, controller.signal, session);
@@ -925,12 +944,33 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
           }
         }
 
-        // Keep busy=true through TTS so mic barge-in cannot abort the speak fetch
+        // Keep busy=true through TTS
         if (earlySpeakPromise) {
+          const rest =
+            (remainder + streamBuf).trim() ||
+            (full ? full.slice(earlySpoken.length).trim() : '');
+          // Prefetch rest audio while sentence 1 is still playing (cuts mid-reply silence)
+          const restPrefetch =
+            rest && !controller.signal.aborted
+              ? fetchGroqSpeech(rest, controller.signal)
+                  .then(async (res) => (res.ok ? res.blob() : null))
+                  .catch(() => null)
+              : Promise.resolve(null);
+
           await earlySpeakPromise;
-          const rest = (remainder + streamBuf).trim() || (full ? full.slice(earlySpoken.length).trim() : '');
+
           if (rest && session === sessionRef.current && activeRef.current && !controller.signal.aborted) {
-            await speakFullReply(rest, controller.signal, session);
+            const prefBlob = await restPrefetch;
+            if (prefBlob?.size) {
+              try {
+                await playGroqWav(prefBlob, controller.signal, session);
+                ttsModeRef.current = 'groq';
+              } catch {
+                await speakFullReply(rest, controller.signal, session);
+              }
+            } else {
+              await speakFullReply(rest, controller.signal, session);
+            }
           }
         } else if (full) {
           setPhaseSafe(userText ? 'speaking' : 'greeting');
@@ -967,6 +1007,8 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
       }
     },
     [
+      fetchGroqSpeech,
+      playGroqWav,
       setMicCapture,
       setPhaseSafe,
       speakFullReply,

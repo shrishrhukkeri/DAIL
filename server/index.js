@@ -68,6 +68,8 @@ function looksLikeMediaContainer(buf) {
   }
   // Ogg
   if (buf[0] === 0x4f && buf[1] === 0x67 && buf[2] === 0x67 && buf[3] === 0x53) return true;
+  // Raw ADTS AAC
+  if (buf[0] === 0xff && (buf[1] & 0xf0) === 0xf0) return true;
   return false;
 }
 
@@ -152,7 +154,8 @@ app.post('/api/chat', requireGroq, async (req, res) => {
     const stream = await req.groq.chat.completions.create(chatParams);
 
     for await (const chunk of stream) {
-      if (req.aborted) break;
+      // Node 20+: req.aborted is deprecated; also watch response close
+      if (req.destroyed || res.writableEnded || res.closed) break;
       const token = chunk.choices?.[0]?.delta?.content;
       if (token) {
         res.write(`data: ${JSON.stringify({ token })}\n\n`);
@@ -257,8 +260,8 @@ app.post('/api/speak', requireGroq, async (req, res) => {
         if (buffer.length) wavs.push(buffer);
       } catch (chunkErr) {
         if (isRateLimited(chunkErr)) {
-          console.warn('Orpheus rate-limited — using fallback TTS');
-          if (wavs.length) break;
+          console.warn('Orpheus rate-limited — using fallback TTS for full text');
+          // Never return a partial Orpheus concat mid-sentence; synthesize the whole reply
           const mpeg = await fallbackMpegTts(cleaned);
           return sendAudio(mpeg, 'audio/mpeg', 'fallback');
         }
