@@ -11,6 +11,8 @@ interface CallScreenProps {
   muted?: boolean;
   onEndCall: () => void;
   onToggleMute?: () => void;
+  /** Safari: tap speaker to re-unlock AudioContext / HTMLAudio mid-call */
+  onUnlockAudio?: () => void;
 }
 
 function statusLabel(status: CallScreenProps['status'], phase?: VoicePhase, error?: string | null) {
@@ -38,8 +40,10 @@ export const CallScreen: React.FC<CallScreenProps> = ({
   muted = false,
   onEndCall,
   onToggleMute,
+  onUnlockAudio,
 }) => {
   const [timer, setTimer] = useState(0);
+  const [soundArmed, setSoundArmed] = useState(false);
   const listening = voicePhase === 'listening' && !muted;
 
   useEffect(() => {
@@ -102,6 +106,11 @@ export const CallScreen: React.FC<CallScreenProps> = ({
             ? `${formatTime(timer)} · ${muted ? 'muted' : statusLabel(status, voicePhase, voiceError)}`
             : 'calling...'}
         </p>
+        {status === 'connected' && !soundArmed && (
+          <p style={{ color: 'rgba(52, 199, 89, 0.9)', fontSize: 13, marginTop: 10 }}>
+            No sound? Tap speaker once
+          </p>
+        )}
       </div>
 
       <div
@@ -114,45 +123,67 @@ export const CallScreen: React.FC<CallScreenProps> = ({
           maxWidth: '280px',
         }}
       >
-        {[
-          {
-            icon: muted ? MicOff : Mic,
-            label: muted ? 'unmute' : 'mute',
-            interactive: true,
-          },
-          { icon: GripVertical, label: 'keypad' },
-          { icon: Volume2, label: 'speaker' },
-          { icon: Plus, label: 'add call' },
-          { icon: Video, label: 'FaceTime' },
-          { icon: User, label: 'contacts' },
-        ].map((item, idx) => {
-          const isMic = Boolean(item.interactive);
-          const MicIcon = item.icon;
+        {(
+          [
+            {
+              icon: muted ? MicOff : Mic,
+              label: muted ? 'unmute' : 'mute',
+              action: 'mute' as const,
+            },
+            { icon: GripVertical, label: 'keypad', action: 'none' as const },
+            { icon: Volume2, label: soundArmed ? 'sound on' : 'speaker', action: 'speaker' as const },
+            { icon: Plus, label: 'add call', action: 'none' as const },
+            { icon: Video, label: 'FaceTime', action: 'none' as const },
+            { icon: User, label: 'contacts', action: 'none' as const },
+          ]
+        ).map((item, idx) => {
+          const interactive = item.action === 'mute' || item.action === 'speaker';
+          const Icon = item.icon;
           return (
             <div key={idx} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
               <button
                 type="button"
-                disabled={!isMic || status !== 'connected'}
+                disabled={!interactive || status !== 'connected'}
                 onClick={() => {
-                  if (isMic) onToggleMute?.();
+                  if (item.action === 'mute') onToggleMute?.();
+                  if (item.action === 'speaker') {
+                    onUnlockAudio?.();
+                    setSoundArmed(true);
+                  }
                 }}
                 style={{
                   width: '50px',
                   height: '50px',
                   borderRadius: '50%',
-                  background: isMic && muted ? 'rgba(255, 59, 48, 0.45)' : 'rgba(255,255,255,0.1)',
-                  border: isMic && muted ? '1px solid #ff3b30' : 'none',
+                  background:
+                    (item.action === 'mute' && muted) || (item.action === 'speaker' && soundArmed)
+                      ? 'rgba(52, 199, 89, 0.35)'
+                      : 'rgba(255,255,255,0.1)',
+                  border:
+                    item.action === 'mute' && muted
+                      ? '1px solid #ff3b30'
+                      : item.action === 'speaker' && soundArmed
+                        ? '1px solid #34c759'
+                        : 'none',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
                   marginBottom: '8px',
                   color: 'white',
-                  cursor: isMic && status === 'connected' ? 'pointer' : 'default',
-                  opacity: !isMic ? 0.55 : 1,
+                  cursor: interactive && status === 'connected' ? 'pointer' : 'default',
+                  opacity: !interactive ? 0.55 : 1,
                 }}
-                aria-label={isMic ? (muted ? 'Unmute' : 'Mute') : item.label}
+                aria-label={
+                  item.action === 'mute'
+                    ? muted
+                      ? 'Unmute'
+                      : 'Mute'
+                    : item.action === 'speaker'
+                      ? 'Enable sound'
+                      : item.label
+                }
               >
-                <MicIcon size={24} />
+                <Icon size={24} />
               </button>
               <span style={{ fontSize: '12px', opacity: 0.6 }}>{item.label}</span>
             </div>

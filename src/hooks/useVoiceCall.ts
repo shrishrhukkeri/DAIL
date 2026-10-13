@@ -21,7 +21,6 @@ const SPEECH_THRESHOLD_MIN = 0.012;
 const SILENCE_MS = 700;
 const MIN_SPEECH_MS = 250;
 const MAX_SPEECH_MS = 12000;
-const BARGE_IN_MS = 180;
 const VAD_INTERVAL_MS = 40;
 /** Ignore mic for a moment after we start listening so TTS echo doesn't get captured. */
 const LISTEN_GRACE_MS = 350;
@@ -39,15 +38,20 @@ function getAudioContextCtor(): typeof AudioContext {
   );
 }
 
+function isSafariBrowser() {
+  if (typeof navigator === 'undefined') return false;
+  const ua = navigator.userAgent;
+  const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const isSafari = /Safari/.test(ua) && !/Chrome|Chromium|Edg|OPR|Firefox/.test(ua);
+  return isIOS || isSafari;
+}
+
 function pickMimeType() {
   if (typeof MediaRecorder === 'undefined') return '';
-  // Safari: webm often unsupported — prefer mp4 there. Chrome prefers webm/opus.
-  const candidates = [
-    'audio/webm;codecs=opus',
-    'audio/webm',
-    'audio/mp4',
-    'audio/aac',
-  ];
+  // Safari/iOS: webm unsupported — prefer mp4 first. Chrome prefers webm/opus.
+  const candidates = isSafariBrowser()
+    ? ['audio/mp4', 'audio/aac', 'audio/webm;codecs=opus', 'audio/webm']
+    : ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/aac'];
   for (const type of candidates) {
     if (MediaRecorder.isTypeSupported(type)) return type;
   }
@@ -158,7 +162,6 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
   const capturingRef = useRef(false);
   const speechStartedAtRef = useRef<number | null>(null);
   const silenceStartedAtRef = useRef<number | null>(null);
-  const bargeStartedAtRef = useRef<number | null>(null);
   const vadTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const mimeTypeRef = useRef('');
   const finalizeLockRef = useRef(false);
@@ -182,63 +185,94 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
       capturingRef.current = false;
       speechStartedAtRef.current = null;
       silenceStartedAtRef.current = null;
-      bargeStartedAtRef.current = null;
     }
   }, []);
 
-  /** Keep one HTMLAudioElement alive — iOS unlock does not transfer to a new Audio(). */
+  /** Keep one HTMLAudioElement in the DOM — iOS unlock does not transfer to a new Audio(). */
   const ensurePlaybackAudio = useCallback(() => {
     let el = htmlAudioRef.current;
     if (!el) {
-      el = new Audio();
+      el = document.createElement('audio');
       el.preload = 'auto';
       el.setAttribute('playsinline', 'true');
       el.setAttribute('webkit-playsinline', 'true');
-      // Safari/iOS property (not only attribute)
       (el as HTMLAudioElement & { playsInline?: boolean }).playsInline = true;
+      el.style.display = 'none';
+      document.body.appendChild(el);
       htmlAudioRef.current = el;
     }
     return el;
   }, []);
 
-  const stopHtmlAudio = useCallback(() => {
-    const el = htmlAudioRef.current;
-    if (el) {
+  /** Near-silent looping audio keeps Safari's media unlock alive across awaits/timeouts. */
+  const startSilentKeepAlive = useCallback(() => {
+    const audio = ensurePlaybackAudio();
+    if (htmlAudioUrlRef.current) {
+      URL.revokeObjectURL(htmlAudioUrlRef.current);
+      htmlAudioUrlRef.current = null;
+    }
+    try {
+      audio.onended = null;
+      audio.onerror = null;
+      audio.loop = true;
+      audio.muted = false;
+      audio.volume = 0.001;
+      if (!audio.src.includes('data:audio/wav')) {
+        audio.src = SILENT_WAV;
+      }
+      void audio.play().catch(() => undefined);
+    } catch {
+      /* ignore */
+    }
+  }, [ensurePlaybackAudio]);
+
+  const stopHtmlAudio = useCallback(
+    (opts?: { preserveUnlock?: boolean }) => {
+      const el = htmlAudioRef.current;
+      if (htmlAudioUrlRef.current) {
+        URL.revokeObjectURL(htmlAudioUrlRef.current);
+        htmlAudioUrlRef.current = null;
+      }
+      if (!el) return;
       try {
         el.onended = null;
         el.onerror = null;
+        if (opts?.preserveUnlock) {
+          startSilentKeepAlive();
+          return;
+        }
+        el.loop = false;
         el.pause();
-        // Keep element; clear src so we don't keep playing old blobs
         el.removeAttribute('src');
         el.load();
       } catch {
         /* ignore */
       }
-    }
-    if (htmlAudioUrlRef.current) {
-      URL.revokeObjectURL(htmlAudioUrlRef.current);
-      htmlAudioUrlRef.current = null;
-    }
-  }, []);
+    },
+    [startSilentKeepAlive],
+  );
 
-  const stopPlayback = useCallback(() => {
-    activeSourcesRef.current.forEach((src) => {
-      try {
-        src.onended = null;
-        src.stop();
-        src.disconnect();
-      } catch {
-        /* ignore */
+  const stopPlayback = useCallback(
+    (opts?: { preserveUnlock?: boolean }) => {
+      activeSourcesRef.current.forEach((src) => {
+        try {
+          src.onended = null;
+          src.stop();
+          src.disconnect();
+        } catch {
+          /* ignore */
+        }
+      });
+      activeSourcesRef.current = [];
+      audioQueueRef.current = [];
+      stopHtmlAudio({ preserveUnlock: opts?.preserveUnlock ?? true });
+      playingRef.current = false;
+      if (typeof window !== 'undefined' && window.speechSynthesis?.speaking) {
+        window.speechSynthesis.cancel();
       }
-    });
-    activeSourcesRef.current = [];
-    audioQueueRef.current = [];
-    stopHtmlAudio();
-    playingRef.current = false;
-    if (typeof window !== 'undefined' && window.speechSynthesis?.speaking) {
-      window.speechSynthesis.cancel();
-    }
-  }, [stopHtmlAudio]);
+    },
+    [stopHtmlAudio],
+  );
 
   const stopKeepAlive = useCallback(() => {
     try {
@@ -281,22 +315,9 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
       /* ignore */
     }
 
-    // Prime the SAME HTMLAudioElement used for TTS (Safari unlock does not transfer)
-    try {
-      const audio = ensurePlaybackAudio();
-      audio.volume = 0.01;
-      audio.src = SILENT_WAV;
-      void audio
-        .play()
-        .then(() => {
-          audio.pause();
-          audio.currentTime = 0;
-          audio.volume = 1;
-        })
-        .catch(() => undefined);
-    } catch {
-      /* ignore */
-    }
+    // Keep looping silent media on the SAME element used for TTS (do not pause — Safari drops unlock)
+    startSilentKeepAlive();
+
     if (typeof window !== 'undefined' && window.speechSynthesis) {
       try {
         window.speechSynthesis.cancel();
@@ -308,7 +329,7 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
         /* ignore */
       }
     }
-  }, [ensurePlaybackAudio, stopKeepAlive]);
+  }, [startSilentKeepAlive, stopKeepAlive]);
 
   const stopRecorderAsync = useCallback(async (): Promise<Blob | null> => {
     const recorder = mediaRecorderRef.current;
@@ -316,7 +337,6 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     capturingRef.current = false;
     speechStartedAtRef.current = null;
     silenceStartedAtRef.current = null;
-    bargeStartedAtRef.current = null;
 
     if (!recorder) {
       chunksRef.current = [];
@@ -356,11 +376,16 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
   const startRecorder = useCallback(async () => {
     const stream = mediaStreamRef.current;
     if (!stream || !activeRef.current || mutedRef.current) return;
+    if (busyRef.current || playingRef.current) return;
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') return;
 
     // Ensure previous recorder fully stopped (Chrome rejects overlapping recorders)
     await stopRecorderAsync();
-    if (!activeRef.current || !mediaStreamRef.current) return;
+    if (!activeRef.current || !mediaStreamRef.current || busyRef.current || playingRef.current) return;
+
+    mediaStreamRef.current.getAudioTracks().forEach((t) => {
+      t.enabled = !mutedRef.current;
+    });
 
     chunksRef.current = [];
     const mimeType = mimeTypeRef.current;
@@ -421,7 +446,7 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     abortRef.current?.abort();
     abortRef.current = null;
     void tearDownMic();
-    stopPlayback();
+    stopPlayback({ preserveUnlock: false });
     stopKeepAlive();
     // Keep playback context alive (suspended) so the next dial can resume under a gesture
     if (playbackCtxRef.current && playbackCtxRef.current.state !== 'closed') {
@@ -448,20 +473,26 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     return Math.sqrt(sum / data.length);
   }, []);
 
+  /** Mic stays off while AI replies so speaker echo cannot re-trigger listening. */
+  const setMicCapture = useCallback((armed: boolean) => {
+    mediaStreamRef.current?.getAudioTracks().forEach((t) => {
+      t.enabled = armed && !mutedRef.current;
+    });
+  }, []);
+
   const playNext = useCallback(() => {
     if (playingRef.current) return;
     const next = audioQueueRef.current.shift();
     const ctx = playbackCtxRef.current;
     if (!next || !ctx || ctx.state === 'closed') {
-      if (activeRef.current && !busyRef.current && phaseRef.current === 'speaking') {
-        void startRecorder();
-        setPhaseSafe('listening');
-      }
+      // Do NOT start the recorder here — turn orchestration resumes listening
+      // only after the full assistant reply finishes.
       return;
     }
 
     playingRef.current = true;
     setPhaseSafe('speaking');
+    setMicCapture(false);
 
     const startSource = () => {
       const source = ctx.createBufferSource();
@@ -493,7 +524,7 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     } else {
       startSource();
     }
-  }, [setPhaseSafe, startRecorder]);
+  }, [setMicCapture, setPhaseSafe]);
 
   const pickBrowserVoice = useCallback(() => {
     if (browserVoiceRef.current) return browserVoiceRef.current;
@@ -557,13 +588,53 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
         };
 
         playingRef.current = true;
+        setMicCapture(false);
         setPhaseSafe('speaking');
         window.speechSynthesis.speak(utter);
       }),
-    [pickBrowserVoice, setPhaseSafe],
+    [pickBrowserVoice, setMicCapture, setPhaseSafe],
   );
 
-  /** Prefer persistent HTMLAudioElement primed during dial gesture (Safari). */
+  const playViaWebAudio = useCallback(
+    async (blob: Blob, signal: AbortSignal, session: number) => {
+      let ctx = playbackCtxRef.current;
+      if (!ctx || ctx.state === 'closed') {
+        ctx = new (getAudioContextCtor())();
+        playbackCtxRef.current = ctx;
+      }
+      if (ctx.state === 'suspended') await ctx.resume();
+      if (ctx.state !== 'running') {
+        throw new Error('AudioContext not running');
+      }
+      const arrayBuf = await blob.arrayBuffer();
+      const audioBuf = await ctx.decodeAudioData(arrayBuf.slice(0));
+      if (signal.aborted || session !== sessionRef.current) {
+        throw new Error('aborted');
+      }
+      audioQueueRef.current.push(audioBuf);
+      playingRef.current = true;
+      setMicCapture(false);
+      setPhaseSafe('speaking');
+      playNextRef.current();
+      await new Promise<void>((resolve, reject) => {
+        const wait = () => {
+          if (signal.aborted || session !== sessionRef.current) {
+            reject(new Error('aborted'));
+            return;
+          }
+          if (!playingRef.current && audioQueueRef.current.length === 0) {
+            resolve();
+            return;
+          }
+          setTimeout(wait, 40);
+        };
+        wait();
+      });
+    },
+    [setMicCapture, setPhaseSafe],
+  );
+
+  /** Persistent HTMLAudio + Web Audio; Safari prefers Web Audio (gesture-unlocked context). */
   const playGroqWav = useCallback(
     async (blob: Blob, signal: AbortSignal, session: number) => {
       if (signal.aborted || !activeRef.current || session !== sessionRef.current) {
@@ -571,97 +642,104 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
       }
       if (!blob.size) throw new Error('Empty TTS audio');
 
-      stopHtmlAudio();
-      // Keep mic tracks enabled for barge-in; rely on echoCancellation + higher barge threshold
+      const preferWebAudio = isSafariBrowser();
 
-      if (htmlAudioUrlRef.current) {
-        URL.revokeObjectURL(htmlAudioUrlRef.current);
-        htmlAudioUrlRef.current = null;
-      }
-      const url = URL.createObjectURL(blob);
-      htmlAudioUrlRef.current = url;
-      const audio = ensurePlaybackAudio();
-      audio.volume = 1;
-      audio.src = url;
-
-      await new Promise<void>((resolve, reject) => {
-        let settled = false;
-        const finish = (err?: Error) => {
-          if (settled) return;
-          settled = true;
-          signal.removeEventListener('abort', onAbort);
-          playingRef.current = false;
-          try {
-            audio.onended = null;
-            audio.onerror = null;
-            audio.pause();
-          } catch {
-            /* ignore */
-          }
+      const tryHtml = () =>
+        new Promise<void>((resolve, reject) => {
           if (htmlAudioUrlRef.current) {
             URL.revokeObjectURL(htmlAudioUrlRef.current);
             htmlAudioUrlRef.current = null;
           }
-          if (err) reject(err);
-          else resolve();
-        };
-        const onAbort = () => {
-          try {
-            audio.pause();
-          } catch {
-            /* ignore */
-          }
-          finish(new Error('aborted'));
-        };
-
-        signal.addEventListener('abort', onAbort);
-        audio.onended = () => finish();
-        audio.onerror = () => finish(new Error('HTMLAudio playback failed'));
-
-        playingRef.current = true;
-        setPhaseSafe('speaking');
-        void audio
-          .play()
-          .then(() => {
-            // playing on unlocked element
-          })
-          .catch(async (err) => {
-            console.warn('HTMLAudio play blocked, trying Web Audio', err);
+          const url = URL.createObjectURL(blob);
+          htmlAudioUrlRef.current = url;
+          const audio = ensurePlaybackAudio();
+          let settled = false;
+          const finish = (err?: Error) => {
+            if (settled) return;
+            settled = true;
+            signal.removeEventListener('abort', onAbort);
+            playingRef.current = false;
             try {
-              let ctx = playbackCtxRef.current;
-              if (!ctx || ctx.state === 'closed') {
-                ctx = new (getAudioContextCtor())();
-                playbackCtxRef.current = ctx;
-              }
-              if (ctx.state === 'suspended') await ctx.resume();
-              const arrayBuf = await blob.arrayBuffer();
-              const audioBuf = await ctx.decodeAudioData(arrayBuf.slice(0));
-              if (signal.aborted || session !== sessionRef.current) {
-                finish(new Error('aborted'));
-                return;
-              }
-              stopHtmlAudio();
-              audioQueueRef.current.push(audioBuf);
-              playNextRef.current();
-              const wait = () => {
-                if (
-                  signal.aborted ||
-                  session !== sessionRef.current ||
-                  (!playingRef.current && audioQueueRef.current.length === 0)
-                ) {
-                  finish(signal.aborted ? new Error('aborted') : undefined);
-                  return;
-                }
-                setTimeout(wait, 40);
-              };
-              wait();
-            } catch (fallbackErr) {
-              finish(fallbackErr instanceof Error ? fallbackErr : new Error('playback failed'));
+              audio.onended = null;
+              audio.onerror = null;
+            } catch {
+              /* ignore */
             }
-          });
-      });
+            if (htmlAudioUrlRef.current) {
+              URL.revokeObjectURL(htmlAudioUrlRef.current);
+              htmlAudioUrlRef.current = null;
+            }
+            // Restore silent loop so the next turn stays unlocked on Safari
+            startSilentKeepAlive();
+            if (err) reject(err);
+            else resolve();
+          };
+          const onAbort = () => {
+            try {
+              audio.pause();
+            } catch {
+              /* ignore */
+            }
+            finish(new Error('aborted'));
+          };
+
+          signal.addEventListener('abort', onAbort);
+          audio.loop = false;
+          audio.muted = false;
+          audio.volume = 1;
+          audio.onended = () => finish();
+          audio.onerror = () => finish(new Error('HTMLAudio playback failed'));
+
+          const startPlay = () => {
+            playingRef.current = true;
+            setMicCapture(false);
+            setPhaseSafe('speaking');
+            void audio.play().then(() => undefined).catch((err) => finish(err instanceof Error ? err : new Error('play blocked')));
+          };
+
+          audio.src = url;
+          if (audio.readyState >= 3) {
+            startPlay();
+          } else {
+            let started = false;
+            const onReady = () => {
+              if (started) return;
+              started = true;
+              audio.removeEventListener('canplaythrough', onReady);
+              audio.removeEventListener('canplay', onReady);
+              startPlay();
+            };
+            audio.addEventListener('canplaythrough', onReady);
+            audio.addEventListener('canplay', onReady);
+            // Safari sometimes never fires canplaythrough for blob URLs
+            setTimeout(onReady, 250);
+            audio.load();
+          }
+        });
+
+      if (preferWebAudio) {
+        try {
+          await playViaWebAudio(blob, signal, session);
+          startSilentKeepAlive();
+          return;
+        } catch (err) {
+          if (signal.aborted || (err instanceof Error && err.message === 'aborted')) throw err;
+          console.warn('Safari Web Audio play failed, trying HTMLAudio', err);
+          await tryHtml();
+          return;
+        }
+      }
+
+      try {
+        await tryHtml();
+      } catch (err) {
+        if (signal.aborted || (err instanceof Error && err.message === 'aborted')) throw err;
+        console.warn('HTMLAudio play blocked, trying Web Audio', err);
+        await playViaWebAudio(blob, signal, session);
+        startSilentKeepAlive();
+      }
     },
-    [ensurePlaybackAudio, setPhaseSafe, stopHtmlAudio],
+    [ensurePlaybackAudio, playViaWebAudio, setMicCapture, setPhaseSafe, startSilentKeepAlive],
   );
 
   const fetchGroqSpeech = useCallback(async (text: string, signal: AbortSignal) => {
@@ -783,8 +861,9 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
       const controller = new AbortController();
       abortRef.current?.abort();
       abortRef.current = controller;
-      stopPlayback();
+      stopPlayback({ preserveUnlock: true });
       busyRef.current = true;
+      setMicCapture(false);
       await stopRecorderAsync();
 
       if (session !== sessionRef.current || !activeRef.current) return;
@@ -866,6 +945,7 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
           !controller.signal.aborted &&
           !mutedRef.current
         ) {
+          setMicCapture(true);
           await startRecorder();
           setPhaseSafe('listening');
         }
@@ -876,6 +956,7 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
         }
         const message = err instanceof Error ? err.message : 'Call failed';
         setError(message);
+        setMicCapture(true);
         await startRecorder();
         setPhaseSafe('listening');
       } finally {
@@ -886,6 +967,7 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
       }
     },
     [
+      setMicCapture,
       setPhaseSafe,
       speakFullReply,
       startRecorder,
@@ -1011,45 +1093,24 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
         noiseFloorRef.current * 0.95 + rms * 0.05,
       );
     }
-    // Higher threshold while TTS plays so echo doesn't false-trigger barge-in
-    const threshold = playingRef.current
-      ? Math.max(SPEECH_THRESHOLD_MIN * 2.2, noiseFloorRef.current * 5)
-      : Math.max(SPEECH_THRESHOLD_MIN, noiseFloorRef.current * 3.2);
+    const threshold = Math.max(SPEECH_THRESHOLD_MIN, noiseFloorRef.current * 3.2);
     const loud = rms >= threshold;
 
-    // Only barge-in while audio is actually playing — not during chat/TTS fetch
-    if (playingRef.current) {
-      if (loud) {
-        if (!bargeStartedAtRef.current) bargeStartedAtRef.current = now;
-        if (now - (bargeStartedAtRef.current || now) >= BARGE_IN_MS) {
-          abortRef.current?.abort();
-          stopPlayback();
-          busyRef.current = false;
-          finalizeLockRef.current = false;
-          playingRef.current = false;
-          void (async () => {
-            await stopRecorderAsync();
-            if (!activeRef.current) return;
-            await startRecorder();
-            capturingRef.current = true;
-            speechStartedAtRef.current = Date.now();
-            silenceStartedAtRef.current = null;
-            bargeStartedAtRef.current = null;
-            setPhaseSafe('listening');
-          })();
-        }
-      } else {
-        bargeStartedAtRef.current = null;
-      }
-      return;
-    }
-
-    if (currentPhase === 'speaking' || currentPhase === 'greeting' || currentPhase === 'thinking') {
+    // While AI is talking / thinking: never listen (speaker echo must not re-arm VAD)
+    if (
+      playingRef.current ||
+      busyRef.current ||
+      currentPhase === 'speaking' ||
+      currentPhase === 'greeting' ||
+      currentPhase === 'thinking'
+    ) {
       return;
     }
 
     if (currentPhase !== 'listening' || busyRef.current || finalizeLockRef.current) return;
     if (now < listenArmedAtRef.current) return;
+    // Guard: never arm capture while assistant audio is still draining
+    if (playingRef.current) return;
 
     if (!mediaRecorderRef.current || mediaRecorderRef.current.state === 'inactive') {
       void startRecorder();
@@ -1077,7 +1138,7 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
         void finalizeSpeechRef.current();
       }
     }
-  }, [getRms, setPhaseSafe, startRecorder, stopPlayback, stopRecorderAsync]);
+  }, [getRms, startRecorder]);
 
   const startVadLoop = useCallback(() => {
     if (vadTimerRef.current) clearInterval(vadTimerRef.current);
@@ -1167,7 +1228,8 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
       vadTimerRef.current = null;
     }
     await stopRecorderAsync();
-    stopPlayback();
+    // Preserve Safari HTMLAudio unlock — do not tear down the silent keep-alive loop
+    stopPlayback({ preserveUnlock: true });
     messagesRef.current = [];
     ttsModeRef.current = 'unset';
     mutedRef.current = false;
@@ -1177,10 +1239,12 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
     if (session !== sessionRef.current) return;
 
     activeRef.current = true;
+    // May be outside gesture — only resumes if already unlocked during dial tap
     unlockAudio();
     if (playbackCtxRef.current?.state === 'suspended') {
-      await playbackCtxRef.current.resume();
+      void playbackCtxRef.current.resume();
     }
+    startSilentKeepAlive();
 
     try {
       if (!streamIsLive(mediaStreamRef.current)) {
@@ -1205,6 +1269,7 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
   }, [
     prepareMic,
     setPhaseSafe,
+    startSilentKeepAlive,
     startVadLoop,
     stopPlayback,
     stopRecorderAsync,
@@ -1243,7 +1308,12 @@ export function useVoiceCall(options: UseVoiceCallOptions = {}) {
       sessionRef.current += 1;
       activeRef.current = false;
       void tearDownMic();
-      stopPlayback();
+      stopPlayback({ preserveUnlock: false });
+      try {
+        htmlAudioRef.current?.remove();
+      } catch {
+        /* ignore */
+      }
       htmlAudioRef.current = null;
       if (playbackCtxRef.current && playbackCtxRef.current.state !== 'closed') {
         void playbackCtxRef.current.close().catch(() => undefined);

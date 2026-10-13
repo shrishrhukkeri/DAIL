@@ -17,6 +17,7 @@ function App() {
     phase,
     error,
     muted,
+    unlockAudio,
     prepareMic,
     releaseMic,
     startCall,
@@ -66,7 +67,11 @@ function App() {
     clearDialTimer();
     const token = ++dialTokenRef.current;
 
-    // Safari: mic + AudioContext MUST be opened in this tap (not after setTimeout)
+    // Safari/iOS: unlock AudioContext + HTMLAudio SYNCHRONOUSLY before any await
+    // (await getUserMedia / permission sheet breaks the user-gesture chain)
+    unlockAudio();
+
+    // Mic still needs to open during this tap; unlock already happened above
     try {
       await prepareMic();
     } catch (err) {
@@ -121,6 +126,7 @@ function App() {
             muted={muted}
             onEndCall={endCall}
             onToggleMute={toggleMute}
+            onUnlockAudio={unlockAudio}
           />
         )}
       </AnimatePresence>
