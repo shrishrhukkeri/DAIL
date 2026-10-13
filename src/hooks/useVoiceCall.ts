@@ -17,11 +17,15 @@ type UseVoiceCallOptions = {
   onFatalError?: (message: string) => void;
 };
 
-const SPEECH_THRESHOLD = 0.018;
-const SILENCE_MS = 550;
-const MIN_SPEECH_MS = 280;
+const SPEECH_THRESHOLD_MIN = 0.012;
+const SILENCE_MS = 700;
+const MIN_SPEECH_MS = 250;
+const MAX_SPEECH_MS = 12000;
 const BARGE_IN_MS = 180;
 const VAD_INTERVAL_MS = 40;
+/** Ignore mic for a moment after we start listening so TTS echo doesn't get captured. */
+const LISTEN_GRACE_MS = 350;
+const MIN_AUDIO_BYTES = 200;
 
 function splitSentences(buffer: string): { complete: string[]; rest: string } {
   const complete: string[] = [];
@@ -136,6 +140,11 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
   const finalizeLockRef = useRef(false);
   /** Monotonic session id — ignores stale async work from a previous call/turn. */
   const sessionRef = useRef(0);
+  /** Stick to one TTS engine per call so the voice doesn't flip mid-conversation. */
+  const ttsModeRef = useRef<'unset' | 'groq' | 'browser'>('unset');
+  const browserVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
+  const noiseFloorRef = useRef(0.005);
+  const listenArmedAtRef = useRef(0);
 
   const runAssistantTurnRef = useRef<(userText?: string) => Promise<void>>(async () => undefined);
   const finalizeSpeechRef = useRef<() => Promise<void>>(async () => undefined);
@@ -144,6 +153,13 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
   const setPhaseSafe = useCallback((next: VoicePhase) => {
     phaseRef.current = next;
     setPhase(next);
+    if (next === 'listening') {
+      listenArmedAtRef.current = Date.now() + LISTEN_GRACE_MS;
+      capturingRef.current = false;
+      speechStartedAtRef.current = null;
+      silenceStartedAtRef.current = null;
+      bargeStartedAtRef.current = null;
+    }
   }, []);
 
   const resetSpeakChain = useCallback(() => {
@@ -221,7 +237,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
         const type = recorder.mimeType || mimeTypeRef.current || 'audio/webm';
         const out = new Blob(chunksRef.current, { type });
         chunksRef.current = [];
-        resolve(out.size > 800 ? out : null);
+        resolve(out.size > MIN_AUDIO_BYTES ? out : null);
       };
       recorder.ondataavailable = (e) => {
         if (e.data.size > 0) chunksRef.current.push(e.data);
@@ -308,6 +324,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     }
     messagesRef.current = [];
     resetSpeakChain();
+    ttsModeRef.current = 'unset';
     mutedRef.current = false;
     setMuted(false);
     setPhaseSafe('idle');
@@ -366,6 +383,20 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
 
   playNextRef.current = playNext;
 
+  const pickBrowserVoice = useCallback(() => {
+    if (browserVoiceRef.current) return browserVoiceRef.current;
+    if (!window.speechSynthesis) return null;
+    const voices = window.speechSynthesis.getVoices();
+    if (!voices.length) return null;
+    const preferred =
+      voices.find((v) => /en(-|_)US/i.test(v.lang) && /Samantha|Alex|Daniel|David|Fred|Google US English/i.test(v.name)) ||
+      voices.find((v) => /en(-|_)US/i.test(v.lang)) ||
+      voices.find((v) => /^en/i.test(v.lang)) ||
+      voices[0];
+    browserVoiceRef.current = preferred;
+    return preferred;
+  }, []);
+
   const speakWithBrowser = useCallback(
     (text: string, signal: AbortSignal, session: number) =>
       new Promise<void>((resolve) => {
@@ -374,11 +405,16 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
           return;
         }
 
-        const utter = new SpeechSynthesisUtterance(text);
-        utter.rate = 1.05;
+        // Strip Orpheus-style [direction] tags so fallback voice stays consistent
+        const clean = text.replace(/\[[^\]]+\]/g, ' ').replace(/\s+/g, ' ').trim();
+        const utter = new SpeechSynthesisUtterance(clean);
+        utter.rate = 1.02;
         utter.pitch = 1;
-        let done = false;
+        utter.lang = 'en-US';
+        const voice = pickBrowserVoice();
+        if (voice) utter.voice = voice;
 
+        let done = false;
         const finish = () => {
           if (done) return;
           done = true;
@@ -400,7 +436,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
         setPhaseSafe('speaking');
         window.speechSynthesis.speak(utter);
       }),
-    [setPhaseSafe],
+    [pickBrowserVoice, setPhaseSafe],
   );
 
   const enqueueSpeech = useCallback(
@@ -413,6 +449,12 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
         .then(async () => {
           if (signal.aborted || !activeRef.current || session !== sessionRef.current) return;
 
+          // Once browser fallback is chosen for this call, never mix in Orpheus
+          if (ttsModeRef.current === 'browser') {
+            await speakWithBrowser(trimmed, signal, session);
+            return;
+          }
+
           const res = await fetch('/api/speak', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -422,11 +464,25 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
 
           if (!res.ok) {
             const errBody = await res.json().catch(() => ({}));
-            console.warn('Groq TTS unavailable, using browser voice:', errBody.error || res.status);
+            console.warn('Groq TTS unavailable, locking browser voice for this call:', errBody.error || res.status);
+            ttsModeRef.current = 'browser';
+            // Warm voices list (Chrome loads async)
+            if (window.speechSynthesis && !window.speechSynthesis.getVoices().length) {
+              await new Promise<void>((r) => {
+                const done = () => {
+                  window.speechSynthesis.removeEventListener('voiceschanged', done);
+                  r();
+                };
+                window.speechSynthesis.addEventListener('voiceschanged', done);
+                setTimeout(done, 300);
+              });
+            }
+            pickBrowserVoice();
             await speakWithBrowser(trimmed, signal, session);
             return;
           }
 
+          ttsModeRef.current = 'groq';
           const blob = await res.blob();
           if (signal.aborted || !activeRef.current || session !== sessionRef.current) return;
 
@@ -447,7 +503,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
           console.error(err);
         });
     },
-    [speakWithBrowser],
+    [pickBrowserVoice, speakWithBrowser],
   );
 
   const waitForPlaybackIdle = useCallback(
@@ -586,6 +642,9 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
 
     const started = speechStartedAtRef.current;
     if (!started || Date.now() - started < MIN_SPEECH_MS) {
+      capturingRef.current = false;
+      speechStartedAtRef.current = null;
+      silenceStartedAtRef.current = null;
       await startRecorder();
       finalizeLockRef.current = false;
       return;
@@ -593,6 +652,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
 
     const blob = await stopRecorderAsync();
     if (session !== sessionRef.current || !activeRef.current) {
+      busyRef.current = false;
       finalizeLockRef.current = false;
       return;
     }
@@ -627,29 +687,44 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
       const { text } = (await res.json()) as { text: string };
       const cleaned = (text || '').trim();
 
-      if (session !== sessionRef.current || !activeRef.current) return;
-
-      if (!cleaned || cleaned.length < 2) {
+      if (session !== sessionRef.current || !activeRef.current) {
         busyRef.current = false;
         finalizeLockRef.current = false;
-        await startRecorder();
-        setPhaseSafe('listening');
+        return;
+      }
+
+      if (!cleaned || cleaned.length < 2) {
+        // Don't silently ignore — speak a fixed prompt (keeps history clean)
+        setPhaseSafe('speaking');
+        enqueueSpeech(
+          "Sorry, I didn't catch that. Please say it again.",
+          controller.signal,
+          session,
+        );
+        await speakChainRef.current.catch(() => undefined);
+        await waitForPlaybackIdle(session, controller.signal);
+        busyRef.current = false;
+        finalizeLockRef.current = false;
+        if (session === sessionRef.current && activeRef.current) {
+          await startRecorder();
+          setPhaseSafe('listening');
+        }
         return;
       }
 
       finalizeLockRef.current = false;
       await runAssistantTurnRef.current(cleaned);
     } catch (err) {
+      busyRef.current = false;
+      finalizeLockRef.current = false;
       if (controller.signal.aborted || !activeRef.current || session !== sessionRef.current) {
         return;
       }
       setError(err instanceof Error ? err.message : 'Transcription failed');
-      busyRef.current = false;
-      finalizeLockRef.current = false;
       await startRecorder();
       setPhaseSafe('listening');
     }
-  }, [setPhaseSafe, startRecorder, stopRecorderAsync]);
+  }, [enqueueSpeech, setPhaseSafe, startRecorder, stopRecorderAsync, waitForPlaybackIdle]);
 
   finalizeSpeechRef.current = finalizeSpeech;
 
@@ -657,9 +732,16 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     if (!activeRef.current || mutedRef.current) return;
 
     const rms = getRms();
-    const loud = rms >= SPEECH_THRESHOLD;
     const now = Date.now();
     const currentPhase = phaseRef.current;
+
+    // Adaptive noise floor while idle-listening
+    if (currentPhase === 'listening' && !capturingRef.current && !busyRef.current) {
+      noiseFloorRef.current = noiseFloorRef.current * 0.95 + rms * 0.05;
+    }
+    const threshold = Math.max(SPEECH_THRESHOLD_MIN, noiseFloorRef.current * 3.2);
+    const loud = rms >= threshold;
+
     const aiAudible =
       playingRef.current || currentPhase === 'speaking' || currentPhase === 'greeting';
 
@@ -672,6 +754,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
           resetSpeakChain();
           busyRef.current = false;
           finalizeLockRef.current = false;
+          playingRef.current = false;
           void (async () => {
             await stopRecorderAsync();
             if (!activeRef.current) return;
@@ -690,6 +773,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     }
 
     if (currentPhase !== 'listening' || busyRef.current || finalizeLockRef.current) return;
+    if (now < listenArmedAtRef.current) return;
 
     if (!mediaRecorderRef.current || mediaRecorderRef.current.state === 'inactive') {
       void startRecorder();
@@ -700,13 +784,20 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
       if (!capturingRef.current) {
         capturingRef.current = true;
         speechStartedAtRef.current = now;
+      } else if (
+        speechStartedAtRef.current &&
+        now - speechStartedAtRef.current >= MAX_SPEECH_MS
+      ) {
+        void finalizeSpeechRef.current();
       }
       return;
     }
 
     if (capturingRef.current) {
       if (!silenceStartedAtRef.current) silenceStartedAtRef.current = now;
-      if (now - silenceStartedAtRef.current >= SILENCE_MS) {
+      const quietFor = now - silenceStartedAtRef.current;
+      const spokenFor = speechStartedAtRef.current ? now - speechStartedAtRef.current : 0;
+      if (quietFor >= SILENCE_MS && spokenFor >= MIN_SPEECH_MS) {
         void finalizeSpeechRef.current();
       }
     }
@@ -770,6 +861,7 @@ export function useVoiceCall(_options: UseVoiceCallOptions = {}) {
     stopPlayback();
     messagesRef.current = [];
     resetSpeakChain();
+    ttsModeRef.current = 'unset';
     mutedRef.current = false;
     setMuted(false);
     setError(null);

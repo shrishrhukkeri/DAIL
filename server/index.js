@@ -150,10 +150,12 @@ app.post('/api/speak', requireGroq, async (req, res) => {
   }
 
   try {
+    // Always the same Orpheus persona — strip LLM vocal-direction tags for steadier delivery
+    const cleaned = text.replace(/\[[^\]]+\]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 2000);
     const response = await req.groq.audio.speech.create({
       model: TTS_MODEL,
       voice: TTS_VOICE,
-      input: text.slice(0, 2000),
+      input: cleaned || text.slice(0, 2000),
       response_format: 'wav',
     });
 
